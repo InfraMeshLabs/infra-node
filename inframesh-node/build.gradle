@@ -1,0 +1,23 @@
+plugins {
+    id 'java-library'
+    id 'io.spring.dependency-management'
+    id 'com.gradleup.shadow' version '9.2.2'
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-autoconfigure'
+    implementation 'org.springframework:spring-web'
+
+    api 'tools.jackson.core:jackson-databind'
+
+    compileOnly 'jakarta.servlet:jakarta.servlet-api'
+
+    implementation 'com.github.oshi:oshi-core:7.6.0'
+    implementation 'org.slf4j:slf4j-api'
+
+    implementation 'org.springframework.ai:spring-ai-starter-model-ollama'
+}
+
+shadowJar {
+    archiveClassifier.set('')
+}
