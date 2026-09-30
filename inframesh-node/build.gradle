@@ -2,6 +2,7 @@ plugins {
     id 'java-library'
     id 'io.spring.dependency-management'
     id 'com.gradleup.shadow' version '9.2.2'
+    id 'com.vanniktech.maven.publish'
 }
 
 dependencies {
@@ -20,4 +21,38 @@ dependencies {
 
 shadowJar {
     archiveClassifier.set('')
+}
+
+mavenPublishing {
+    publishToMavenCentral()
+    signAllPublications()
+
+    coordinates(project.group as String, 'inframesh-node', project.version as String)
+
+    pom {
+        name = 'InfraMesh Node'
+        description = 'Spring Boot auto-configuration module for node-level health monitoring (CPU/GPU/memory), and chat inference routing used across the InfraMesh platform (Console, Router, Worker).'
+        url = 'https://github.com/InfraMeshLabs/infra-node'
+
+        licenses {
+            license {
+                name = 'The Apache License, Version 2.0'
+                url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+            }
+        }
+
+        developers {
+            developer {
+                id = 'koboolean'
+                name = 'koboolean'
+                email = 'koboolean@gmail.com'
+            }
+        }
+
+        scm {
+            url = 'https://github.com/InfraMeshLabs/infra-node'
+            connection = 'scm:git:git://github.com/InfraMeshLabs/infra-node.git'
+            developerConnection = 'scm:git:ssh://git@github.com/InfraMeshLabs/infra-node.git'
+        }
+    }
 }
