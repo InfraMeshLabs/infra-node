@@ -42,6 +42,7 @@ A Router is optional when Console uses a built-in routing strategy.
 - Common Router and Worker protocol contracts
 - Shared inference and chat DTOs
 - Tool calling contracts
+- Node registration and outbound connection protocol contracts
 - Node health monitoring
 - CPU and memory monitoring
 - NVIDIA GPU monitoring
@@ -52,6 +53,15 @@ A Router is optional when Console uses a built-in routing strategy.
 ## Protocol
 
 `infra-node` acts as the common communication contract between InfraMesh components.
+
+```text
+Common Protocol
+├── Routing Protocol
+├── Worker Protocol
+├── Node Health Protocol
+├── Node Registration Protocol
+└── Node Connection Protocol
+```
 
 ```text
 Console
@@ -135,6 +145,46 @@ Router / Worker
 Session creation and Worker affinity are managed by Console.
 
 `infra-node` only defines and transports the session identifier.
+
+## Node Registration & Connection Protocol
+
+> **Contract only.** `infra-node` defines the DTOs and enums below. Registration handling,
+> credential issuance, outbound connections, connection lifecycle, reconnect, and heartbeat
+> are **not implemented** yet — they belong to the Console, Router, and Worker runtimes.
+
+Today Console calls Router and Worker nodes directly over HTTP (`DIRECT`). A future
+`OUTBOUND` mode lets nodes open a persistent connection to Console, so they do not need
+to expose a public IP or port.
+
+```text
+DIRECT     Console ──HTTP──▶ Router / Worker
+OUTBOUND   Router / Worker ──Persistent Connection──▶ Console   (planned)
+```
+
+Contracts:
+
+```text
+NodeType                  ROUTER / WORKER
+NodeConnectionMode        DIRECT / OUTBOUND
+NodeConnectionState       CONNECTED / DISCONNECTED / RECONNECTING
+NodeRegistrationRequest   registrationToken, name, nodeType
+NodeRegistrationResponse  nodeId, credential
+NodeMessageType           CONNECT, CONNECT_ACK, HEARTBEAT, HEARTBEAT_ACK, REQUEST, RESPONSE, ERROR
+NodeEnvelope<T>           requestId, type, payload
+```
+
+Intended flow:
+
+```text
+registrationToken ──▶ Registration ──▶ nodeId + credential
+nodeId + credential ──▶ Connection handshake ──▶ NodeEnvelope messages
+```
+
+- The registration token is one-time; reconnects use `nodeId` + `credential`.
+- The credential is used only during the connection handshake and is never placed in a `NodeEnvelope`.
+- `requestId` correlates a request with its response on a connection. It is distinct from
+  `sessionId`, which identifies a user inference session.
+- `NodeConnectionState` describes the connection only and is independent of node health.
 
 ## Node Health
 
