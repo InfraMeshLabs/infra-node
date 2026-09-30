@@ -1,0 +1,17 @@
+{
+  "hints": [
+    {
+      "name": "inframesh.node.connection-mode",
+      "values": [
+        {
+          "value": "DIRECT",
+          "description": "Console calls the node over HTTP. Default."
+        },
+        {
+          "value": "OUTBOUND",
+          "description": "The node opens a persistent WebSocket connection to Console (requires console-url, node-id and credential)."
+        }
+      ]
+    }
+  ]
+}

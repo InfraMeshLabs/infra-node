@@ -20,6 +20,11 @@ public class NodeConnectionProperties {
      */
     private NodeConnectionMode connectionMode = NodeConnectionMode.DIRECT;
 
+    /**
+     * Base URL of InfraMesh Console, e.g. {@code https://console.example.com}. Required
+     * for OUTBOUND. {@code http}/{@code https} are mapped to {@code ws}/{@code wss};
+     * {@code ws}/{@code wss} are used as-is.
+     */
     private String consoleUrl;
 
     /**
@@ -32,6 +37,9 @@ public class NodeConnectionProperties {
      */
     private String credential;
 
+    /**
+     * OUTBOUND connection settings. Only used when connection-mode is {@code OUTBOUND}.
+     */
     private final Outbound outbound = new Outbound();
 
     public NodeConnectionMode getConnectionMode() {
@@ -72,8 +80,14 @@ public class NodeConnectionProperties {
 
     public static class Outbound {
 
+        /**
+         * Interval between HEARTBEAT messages sent to Console while connected.
+         */
         private Duration heartbeatInterval = Duration.ofSeconds(10);
 
+        /**
+         * Reconnect backoff settings (exponential backoff with full jitter).
+         */
         private final Reconnect reconnect = new Reconnect();
 
         public Duration getHeartbeatInterval() {
@@ -90,8 +104,14 @@ public class NodeConnectionProperties {
 
         public static class Reconnect {
 
+            /**
+             * Minimum delay before a reconnect attempt, and the base of the exponential backoff.
+             */
             private Duration initialDelay = Duration.ofSeconds(1);
 
+            /**
+             * Upper bound of the reconnect delay.
+             */
             private Duration maxDelay = Duration.ofSeconds(30);
 
             public Duration getInitialDelay() {

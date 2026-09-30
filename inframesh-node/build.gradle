@@ -6,6 +6,7 @@ plugins {
 
 dependencies {
     implementation 'org.springframework.boot:spring-boot-autoconfigure'
+    annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
     implementation 'org.springframework:spring-web'
 
     api 'tools.jackson.core:jackson-databind'
@@ -15,6 +16,12 @@ dependencies {
 
     implementation 'com.github.oshi:oshi-core:7.6.0'
     implementation 'org.slf4j:slf4j-api'
+}
+
+// Lets spring-boot-configuration-processor merge
+// META-INF/additional-spring-configuration-metadata.json into the generated metadata.
+tasks.named('compileJava') {
+    inputs.files(tasks.named('processResources'))
 }
 
 mavenPublishing {
