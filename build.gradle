@@ -3,7 +3,7 @@ plugins {
 }
 
 allprojects {
-    group = 'com.inframesh'
+    group = 'io.github.inframeshlabs'
     version = '1.0.0'
 
     repositories {
