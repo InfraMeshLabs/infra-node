@@ -20,7 +20,7 @@ dependencies {
 }
 
 shadowJar {
-    archiveClassifier.set('')
+    archiveClassifier.set('all')
 }
 
 mavenPublishing {
