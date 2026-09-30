@@ -170,21 +170,29 @@ NodeConnectionState       CONNECTED / DISCONNECTED / RECONNECTING
 NodeRegistrationRequest   registrationToken, name, nodeType
 NodeRegistrationResponse  nodeId, credential
 NodeMessageType           CONNECT, CONNECT_ACK, HEARTBEAT, HEARTBEAT_ACK, REQUEST, RESPONSE, ERROR
-NodeEnvelope<T>           requestId, type, payload
+NodeEnvelope<T>           messageId, type, nodeId, timestamp, requestId, payload
+NodeHeartbeat             (empty; heartbeat time is NodeEnvelope.timestamp)
 ```
 
 Intended flow:
 
 ```text
 registrationToken ──▶ Registration ──▶ nodeId + credential
-nodeId + credential ──▶ Connection handshake ──▶ NodeEnvelope messages
+nodeId + credential ──▶ Connection handshake ──▶ NodeEnvelope<NodeHeartbeat> / other messages
 ```
 
 - The registration token is one-time; reconnects use `nodeId` + `credential`.
 - The credential is used only during the connection handshake and is never placed in a `NodeEnvelope`.
-- `requestId` correlates a request with its response on a connection. It is distinct from
-  `sessionId`, which identifies a user inference session.
+- `messageId` identifies the message itself, for debugging and tracing. It is distinct from
+  `requestId`, which correlates a request with its response on the connection, which is in
+  turn distinct from `sessionId`, which identifies a user inference session.
+- `NodeEnvelope.nodeId` is the external identity of the sending node
+  (`NodeRegistrationResponse.nodeId`). Once a connection is authenticated to a nodeId, the
+  receiving side must verify every `NodeEnvelope.nodeId` on that connection matches — it must
+  never trust the value as sent.
 - `NodeConnectionState` describes the connection only and is independent of node health.
+- A node sends `NodeEnvelope<NodeHeartbeat>` periodically over its connection to signal it is
+  still alive.
 
 ## Node Health
 

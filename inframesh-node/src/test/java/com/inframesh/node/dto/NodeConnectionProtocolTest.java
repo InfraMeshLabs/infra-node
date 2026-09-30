@@ -1,6 +1,7 @@
 package com.inframesh.node.dto;
 
 import com.inframesh.node.dto.connection.NodeEnvelope;
+import com.inframesh.node.dto.connection.NodeHeartbeat;
 import com.inframesh.node.dto.registration.NodeRegistrationRequest;
 import com.inframesh.node.dto.registration.NodeRegistrationResponse;
 import com.inframesh.node.enums.NodeConnectionMode;
@@ -13,6 +14,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.time.Instant;
 import java.util.Map;
 import java.util.UUID;
 
@@ -86,16 +88,23 @@ class NodeConnectionProtocolTest {
 
     @Test
     void envelopeWithTypedPayloadRoundTrips() {
+        UUID nodeId = UUID.fromString("e56f73e5-15ad-4cc0-b24c-f58f90c70f42");
+        Instant timestamp = Instant.parse("2026-09-30T05:30:00Z");
         NodeEnvelope<TestPayload> envelope = new NodeEnvelope<>(
-                "req-123",
+                "2d15d7cb-4d6d-41a0-b620-98e06343833d",
                 NodeMessageType.REQUEST,
+                nodeId,
+                timestamp,
+                "req-123",
                 new TestPayload("ONLINE", 3)
         );
 
         String json = mapper.writeValueAsString(envelope);
 
-        assertThat(json).contains("\"requestId\":\"req-123\"");
+        assertThat(json).contains("\"messageId\":\"2d15d7cb-4d6d-41a0-b620-98e06343833d\"");
         assertThat(json).contains("\"type\":\"REQUEST\"");
+        assertThat(json).contains("\"nodeId\":\"e56f73e5-15ad-4cc0-b24c-f58f90c70f42\"");
+        assertThat(json).contains("\"requestId\":\"req-123\"");
         assertThat(json).contains("\"payload\":{\"status\":\"ONLINE\",\"activeRequests\":3}");
 
         NodeEnvelope<TestPayload> restored = mapper.readValue(json, new TypeReference<NodeEnvelope<TestPayload>>() {
@@ -108,8 +117,11 @@ class NodeConnectionProtocolTest {
     void envelopeDeserializesUntypedPayload() {
         String json = """
                 {
+                  "messageId": "msg-1",
                   "requestId": "req-123",
                   "type": "HEARTBEAT",
+                  "nodeId": "e56f73e5-15ad-4cc0-b24c-f58f90c70f42",
+                  "timestamp": "2026-09-30T05:30:00Z",
                   "payload": {"status": "ONLINE"}
                 }
                 """;
@@ -119,13 +131,15 @@ class NodeConnectionProtocolTest {
 
         assertThat(envelope.requestId()).isEqualTo("req-123");
         assertThat(envelope.type()).isEqualTo(NodeMessageType.HEARTBEAT);
+        assertThat(envelope.nodeId()).isEqualTo(UUID.fromString("e56f73e5-15ad-4cc0-b24c-f58f90c70f42"));
+        assertThat(envelope.timestamp()).isEqualTo(Instant.parse("2026-09-30T05:30:00Z"));
         assertThat(envelope.payload()).containsEntry("status", "ONLINE");
     }
 
     @Test
     void envelopeWithoutPayloadDeserializesToNull() {
         String json = """
-                {"requestId": "req-1", "type": "HEARTBEAT_ACK"}
+                {"messageId": "msg-1", "requestId": "req-1", "type": "HEARTBEAT_ACK"}
                 """;
 
         NodeEnvelope<TestPayload> envelope = mapper.readValue(json, new TypeReference<NodeEnvelope<TestPayload>>() {
@@ -133,6 +147,70 @@ class NodeConnectionProtocolTest {
 
         assertThat(envelope.type()).isEqualTo(NodeMessageType.HEARTBEAT_ACK);
         assertThat(envelope.payload()).isNull();
+    }
+
+    @Test
+    void envelopeFieldsAreRetained() {
+        UUID nodeId = UUID.fromString("e56f73e5-15ad-4cc0-b24c-f58f90c70f42");
+        Instant timestamp = Instant.parse("2026-09-30T05:30:00Z");
+        NodeHeartbeat payload = new NodeHeartbeat();
+
+        NodeEnvelope<NodeHeartbeat> envelope = new NodeEnvelope<>(
+                "2d15d7cb-4d6d-41a0-b620-98e06343833d",
+                NodeMessageType.HEARTBEAT,
+                nodeId,
+                timestamp,
+                null,
+                payload
+        );
+
+        assertThat(envelope.messageId()).isEqualTo("2d15d7cb-4d6d-41a0-b620-98e06343833d");
+        assertThat(envelope.type()).isEqualTo(NodeMessageType.HEARTBEAT);
+        assertThat(envelope.nodeId()).isEqualTo(nodeId);
+        assertThat(envelope.timestamp()).isEqualTo(timestamp);
+        assertThat(envelope.payload()).isEqualTo(payload);
+    }
+
+    @Test
+    void heartbeatEnvelopeSerializesToJson() {
+        UUID nodeId = UUID.fromString("e56f73e5-15ad-4cc0-b24c-f58f90c70f42");
+        Instant timestamp = Instant.parse("2026-09-30T05:30:00Z");
+        NodeEnvelope<NodeHeartbeat> envelope = new NodeEnvelope<>(
+                "2d15d7cb-4d6d-41a0-b620-98e06343833d",
+                NodeMessageType.HEARTBEAT,
+                nodeId,
+                timestamp,
+                null,
+                new NodeHeartbeat()
+        );
+
+        String json = mapper.writeValueAsString(envelope);
+
+        assertThat(json).contains("\"messageId\":\"2d15d7cb-4d6d-41a0-b620-98e06343833d\"");
+        assertThat(json).contains("\"type\":\"HEARTBEAT\"");
+        assertThat(json).contains("\"nodeId\":\"e56f73e5-15ad-4cc0-b24c-f58f90c70f42\"");
+        assertThat(json).contains("\"timestamp\":\"2026-09-30T05:30:00Z\"");
+    }
+
+    @Test
+    void heartbeatEnvelopeDeserializesFromJson() {
+        String json = """
+                {
+                  "messageId": "2d15d7cb-4d6d-41a0-b620-98e06343833d",
+                  "type": "HEARTBEAT",
+                  "nodeId": "e56f73e5-15ad-4cc0-b24c-f58f90c70f42",
+                  "timestamp": "2026-09-30T05:30:00Z",
+                  "payload": {}
+                }
+                """;
+
+        NodeEnvelope<NodeHeartbeat> envelope = mapper.readValue(json, new TypeReference<NodeEnvelope<NodeHeartbeat>>() {
+        });
+
+        assertThat(envelope.type()).isEqualTo(NodeMessageType.HEARTBEAT);
+        assertThat(envelope.nodeId()).isEqualTo(UUID.fromString("e56f73e5-15ad-4cc0-b24c-f58f90c70f42"));
+        assertThat(envelope.timestamp()).isEqualTo(Instant.parse("2026-09-30T05:30:00Z"));
+        assertThat(envelope.payload()).isEqualTo(new NodeHeartbeat());
     }
 
     private <E extends Enum<E>> void assertRoundTrip(E value, Class<E> type) {
