@@ -230,7 +230,10 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
             log.info("Shutting down InfraMesh outbound connection, nodeId={}", properties.getNodeId());
             disconnect();
             scheduler.shutdownNow();
-            healthScheduler.shutdownNow();
+            // Not shutdownNow(): interrupting an in-flight CPU sample only produces a noisy warning.
+            // Periodic tasks are dropped on shutdown, and a report still being collected finds the
+            // connection DISCONNECTED and is never sent.
+            healthScheduler.shutdown();
             messageExecutor.shutdownNow();
         }
         callback.run();
