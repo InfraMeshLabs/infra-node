@@ -8,9 +8,15 @@ package com.inframesh.node.enums;
 public enum NodeMessageType {
     CONNECT,
     CONNECT_ACK,
+
     HEARTBEAT,
     HEARTBEAT_ACK,
+
+    HEALTH,
+    HEALTH_ACK,
+
     REQUEST,
     RESPONSE,
+
     ERROR
 }
