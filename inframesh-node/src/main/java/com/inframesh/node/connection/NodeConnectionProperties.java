@@ -86,6 +86,13 @@ public class NodeConnectionProperties {
         private Duration heartbeatInterval = Duration.ofSeconds(10);
 
         /**
+         * Interval between HEALTH messages (node runtime health, {@code NodeHealthResponse}) sent to
+         * Console while connected. Independent of the heartbeat: a HEARTBEAT only says the connection
+         * is alive, HEALTH says how the node itself is doing ({@code CONNECTED != HEALTHY}).
+         */
+        private Duration healthInterval = Duration.ofSeconds(30);
+
+        /**
          * Reconnect backoff settings (exponential backoff with full jitter).
          */
         private final Reconnect reconnect = new Reconnect();
@@ -96,6 +103,14 @@ public class NodeConnectionProperties {
 
         public void setHeartbeatInterval(Duration heartbeatInterval) {
             this.heartbeatInterval = heartbeatInterval;
+        }
+
+        public Duration getHealthInterval() {
+            return healthInterval;
+        }
+
+        public void setHealthInterval(Duration healthInterval) {
+            this.healthInterval = healthInterval;
         }
 
         public Reconnect getReconnect() {

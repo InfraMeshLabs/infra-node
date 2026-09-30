@@ -3,7 +3,9 @@ package com.inframesh.node.connection;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import com.inframesh.node.dto.NodeHealthResponse;
 import com.inframesh.node.dto.connection.NodeEnvelope;
+import com.inframesh.node.enums.NodeStatus;
 import com.inframesh.node.enums.NodeConnectionMode;
 import com.inframesh.node.enums.NodeConnectionState;
 import com.inframesh.node.enums.NodeMessageType;
@@ -30,6 +32,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -538,8 +542,179 @@ class WebSocketOutboundNodeConnectionTest {
     }
 
     // ------------------------------------------------------------------
+    // HEALTH reporting
+    // ------------------------------------------------------------------
+
+    @Test
+    void health_sentAsHealthEnvelopeCarryingNodeHealthResponse_separateFromHeartbeat() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId)
+                .heartbeat(Duration.ofMillis(100)).health(Duration.ofMillis(150), () -> SAMPLE_HEALTH));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        JsonNode health = JsonMapper.shared().readTree(awaitFrameContaining("\"type\":\"HEALTH\""));
+        assertThat(health.path("nodeId").asString()).isEqualTo(nodeId.toString());
+        assertThat(health.path("messageId").asString()).isNotBlank();
+        assertThat(health.path("timestamp").isMissingNode()).isFalse();
+        // Exactly NodeHealthResponse - the DIRECT /api/v1/health payload, with no node type added.
+        assertThat(JsonMapper.shared().treeToValue(health.path("payload"), NodeHealthResponse.class))
+                .isEqualTo(SAMPLE_HEALTH);
+        assertThat(health.path("payload").has("nodeType")).isFalse();
+
+        // HEARTBEAT keeps flowing independently and never carries health.
+        JsonNode heartbeat = JsonMapper.shared().readTree(awaitFrameContaining("\"type\":\"HEARTBEAT\""));
+        assertThat(heartbeat.path("payload").has("status")).isFalse();
+    }
+
+    @Test
+    void health_notSentWithoutHealthSource() throws Exception {
+        server = new FakeConsoleServer();
+        connection = newConnection(options(server.baseUrl()).heartbeat(Duration.ofMillis(100)));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        for (int i = 0; i < 3; i++) {
+            assertThat(server.awaitTextFrame(2)).doesNotContain("\"type\":\"HEALTH\"");
+        }
+    }
+
+    @Test
+    void health_notCollectedOrSentWhileDisconnected() throws Exception {
+        AtomicInteger collections = new AtomicInteger();
+        server = new FakeConsoleServer();
+        connection = newConnection(options(server.baseUrl())
+                .health(Duration.ofMillis(100), () -> {
+                    collections.incrementAndGet();
+                    return SAMPLE_HEALTH;
+                }));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+        awaitFrameContaining("\"type\":\"HEALTH\"");
+
+        connection.disconnect();
+        server.awaitTextFrame(1); // drain a report that may already be in flight
+        int afterDisconnect = collections.get();
+
+        assertThat(server.awaitTextFrame(1)).isNull();
+        assertThat(collections.get()).isEqualTo(afterDisconnect);
+    }
+
+    @Test
+    void health_resumesAfterReconnect() throws Exception {
+        server = new FakeConsoleServer();
+        connection = newConnection(options(server.baseUrl())
+                .health(Duration.ofMillis(200), () -> SAMPLE_HEALTH)
+                .reconnect(Duration.ofMillis(50), Duration.ofMillis(200)));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+        assertThat(server.awaitHandshakeHeaders(5)).isNotNull();
+        awaitFrameContaining("\"type\":\"HEALTH\"");
+
+        server.dropCurrentConnection();
+        assertThat(server.awaitHandshakeHeaders(5)).isNotNull();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        assertThat(awaitFrameContaining("\"type\":\"HEALTH\"")).isNotNull();
+    }
+
+    @Test
+    void stop_shutsDownHealthScheduler() throws Exception {
+        AtomicInteger collections = new AtomicInteger();
+        server = new FakeConsoleServer();
+        connection = newConnection(options(server.baseUrl())
+                .health(Duration.ofMillis(100), () -> {
+                    collections.incrementAndGet();
+                    return SAMPLE_HEALTH;
+                }));
+
+        connection.start();
+        awaitState(NodeConnectionState.CONNECTED);
+        awaitFrameContaining("\"type\":\"HEALTH\"");
+
+        connection.stop();
+        server.awaitTextFrame(1);
+        int afterStop = collections.get();
+
+        Thread.sleep(500);
+        assertThat(collections.get()).isEqualTo(afterStop);
+        assertThat(server.awaitTextFrame(1)).isNull();
+    }
+
+    @Test
+    void failingHealthSource_skipsReportButKeepsReporting() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        server = new FakeConsoleServer();
+        connection = newConnection(options(server.baseUrl())
+                .health(Duration.ofMillis(100), () -> {
+                    if (calls.incrementAndGet() == 1) {
+                        throw new IllegalStateException("collector failed");
+                    }
+                    return SAMPLE_HEALTH;
+                }));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        assertThat(awaitFrameContaining("\"type\":\"HEALTH\"")).isNotNull();
+        assertThat(calls.get()).isGreaterThanOrEqualTo(2);
+        assertThat(connection.isConnected()).isTrue();
+    }
+
+    @Test
+    void healthAck_isDeliveredToHandlersAndDoesNotChangeConnectionState() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        BlockingQueue<NodeEnvelope<JsonNode>> received = new LinkedBlockingQueue<>();
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId)
+                .health(Duration.ofMillis(100), () -> SAMPLE_HEALTH)
+                .messageHandlers(List.of(received::add)));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+        String healthMessageId = JsonMapper.shared()
+                .readTree(awaitFrameContaining("\"type\":\"HEALTH\"")).path("messageId").asString();
+
+        server.sendTextFrame("{\"messageId\":\"ack-h\",\"type\":\"HEALTH_ACK\",\"nodeId\":\"" + nodeId
+                + "\",\"requestId\":\"" + healthMessageId + "\"}");
+
+        NodeEnvelope<JsonNode> ack = received.poll(5, TimeUnit.SECONDS);
+        assertThat(ack).isNotNull();
+        assertThat(ack.type()).isEqualTo(NodeMessageType.HEALTH_ACK);
+        assertThat(connection.isConnected()).isTrue();
+        // Reporting carries on unaffected by the ACK.
+        assertThat(awaitFrameContaining("\"type\":\"HEALTH\"")).isNotNull();
+    }
+
+    @Test
+    void credential_neverAppearsInHealthFrames() throws Exception {
+        String credential = "health-secret-" + UUID.randomUUID();
+        server = new FakeConsoleServer();
+        connection = newConnection(options(server.baseUrl()).credential(credential)
+                .health(Duration.ofMillis(100), () -> SAMPLE_HEALTH));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        assertThat(awaitFrameContaining("\"type\":\"HEALTH\"")).doesNotContain(credential);
+    }
+
+    // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
+
+    private static final NodeHealthResponse SAMPLE_HEALTH = new NodeHealthResponse(
+            NodeStatus.UP,
+            new NodeHealthResponse.SystemInfo(
+                    new NodeHealthResponse.CpuInfo("test-cpu", 12.5),
+                    new NodeHealthResponse.MemoryInfo(1000L, 400L, 600L),
+                    List.of()),
+            new NodeHealthResponse.RuntimeInfo(3));
 
     private static void await(CountDownLatch latch) {
         try {
@@ -599,9 +774,11 @@ class WebSocketOutboundNodeConnectionTest {
         properties.setNodeId(options.nodeId);
         properties.setCredential(options.credential);
         properties.getOutbound().setHeartbeatInterval(options.heartbeat);
+        properties.getOutbound().setHealthInterval(options.healthInterval);
         properties.getOutbound().getReconnect().setInitialDelay(options.reconnectInitial);
         properties.getOutbound().getReconnect().setMaxDelay(options.reconnectMax);
-        return new WebSocketOutboundNodeConnection(properties, options.requestHandler, options.messageHandlers);
+        return new WebSocketOutboundNodeConnection(
+                properties, options.requestHandler, options.messageHandlers, options.healthSource);
     }
 
     private static final class Options {
@@ -613,6 +790,8 @@ class WebSocketOutboundNodeConnectionTest {
         private Duration reconnectMax = Duration.ofMillis(200);
         private NodeRequestHandler<?, ?> requestHandler;
         private List<NodeMessageHandler> messageHandlers = List.of();
+        private Duration healthInterval = Duration.ofSeconds(30);
+        private Supplier<NodeHealthResponse> healthSource;
 
         private Options(String consoleUrl) {
             this.consoleUrl = consoleUrl;
@@ -646,6 +825,12 @@ class WebSocketOutboundNodeConnectionTest {
 
         Options messageHandlers(List<NodeMessageHandler> value) {
             messageHandlers = value;
+            return this;
+        }
+
+        Options health(Duration interval, Supplier<NodeHealthResponse> source) {
+            healthInterval = interval;
+            healthSource = source;
             return this;
         }
     }

@@ -1,5 +1,6 @@
 package com.inframesh.node.connection;
 
+import com.inframesh.node.dto.NodeHealthResponse;
 import com.inframesh.node.dto.connection.NodeEnvelope;
 import com.inframesh.node.dto.connection.NodeHeartbeat;
 import com.inframesh.node.enums.NodeConnectionState;
@@ -15,6 +16,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -29,21 +31,31 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 /**
  * WebSocket-based {@link OutboundNodeConnection} maintaining a persistent
  * connection from this node (Worker or Router) to InfraMesh Console.
  *
  * Owns every piece of connection infrastructure so node implementations do not:
- * handshake authentication headers, heartbeat, reconnect with exponential
- * backoff + jitter, graceful shutdown, {@link NodeEnvelope} (de)serialization,
+ * handshake authentication headers, heartbeat, HEALTH reporting, reconnect with
+ * exponential backoff + jitter, graceful shutdown, {@link NodeEnvelope} (de)serialization,
  * and dispatch of inbound messages to {@link NodeRequestHandler} /
  * {@link NodeMessageHandler}. It never interprets business payloads.
  *
  * Registered as a {@link SmartLifecycle} bean so Spring starts it once the
  * application context is up and stops it - in the order required by the
  * outbound protocol: forbid further reconnects, cancel any pending reconnect,
- * stop the heartbeat, then close the socket - during application shutdown.
+ * stop the heartbeat and HEALTH reporting, then close the socket - during
+ * application shutdown.
+ *
+ * HEARTBEAT and HEALTH are deliberately separate: HEARTBEAT only proves the
+ * connection is alive, HEALTH carries the node's runtime health
+ * ({@link NodeHealthResponse}, the same payload DIRECT serves from
+ * {@code GET /api/v1/health}) - {@code CONNECTED != HEALTHY}. Both are sent only
+ * while CONNECTED and restart on every (re)connect. Their ACKs are delivered to
+ * {@link NodeMessageHandler}s like any other non-REQUEST message and never change
+ * connection state.
  *
  * A connection failure here never fails node startup or brings the process
  * down; it is only ever logged and retried.
@@ -62,11 +74,16 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
     private final NodeConnectionProperties properties;
     private final NodeRequestHandler<?, ?> requestHandler;
     private final List<NodeMessageHandler> messageHandlers;
+    private final Supplier<NodeHealthResponse> healthSource;
     private final ReconnectBackoff backoff;
     private final HttpClient httpClient = HttpClient.newHttpClient();
     private final JsonMapper jsonMapper = JsonMapper.shared();
     private final ScheduledExecutorService scheduler =
             Executors.newSingleThreadScheduledExecutor(daemonThreads("inframesh-outbound-connection"));
+    // Health collection can block (CPU load is sampled over ~1s), so it runs on its own thread
+    // and never delays heartbeats or reconnects on the connection scheduler.
+    private final ScheduledExecutorService healthScheduler =
+            Executors.newSingleThreadScheduledExecutor(daemonThreads("inframesh-outbound-health"));
     // Inbound messages are handled on a separate executor - a REQUEST (inference, routing decision)
     // can take long, and blocking the java.net.http.WebSocket listener thread would also delay
     // heartbeats, other REQUESTs and connection events. One thread per in-flight message, so no
@@ -87,6 +104,7 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
 
     private volatile WebSocket webSocket;
     private volatile ScheduledFuture<?> heartbeatTask;
+    private volatile ScheduledFuture<?> healthTask;
     private volatile ScheduledFuture<?> reconnectTask;
 
     public WebSocketOutboundNodeConnection(NodeConnectionProperties properties) {
@@ -102,9 +120,21 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
     public WebSocketOutboundNodeConnection(NodeConnectionProperties properties,
                                            NodeRequestHandler<?, ?> requestHandler,
                                            List<NodeMessageHandler> messageHandlers) {
+        this(properties, requestHandler, messageHandlers, null);
+    }
+
+    /**
+     * @param healthSource collects this node's runtime health for periodic HEALTH messages;
+     *                     {@code null} disables HEALTH reporting (the connection still heartbeats).
+     */
+    public WebSocketOutboundNodeConnection(NodeConnectionProperties properties,
+                                           NodeRequestHandler<?, ?> requestHandler,
+                                           List<NodeMessageHandler> messageHandlers,
+                                           Supplier<NodeHealthResponse> healthSource) {
         this.properties = properties;
         this.requestHandler = requestHandler;
         this.messageHandlers = List.copyOf(messageHandlers);
+        this.healthSource = healthSource;
         this.backoff = new ReconnectBackoff(
                 properties.getOutbound().getReconnect().getInitialDelay(),
                 properties.getOutbound().getReconnect().getMaxDelay());
@@ -125,6 +155,7 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
         shuttingDown.set(true);
         cancelReconnect();
         stopHeartbeat();
+        stopHealthReporting();
         state.set(NodeConnectionState.DISCONNECTED);
 
         WebSocket ws = this.webSocket;
@@ -199,6 +230,7 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
             log.info("Shutting down InfraMesh outbound connection, nodeId={}", properties.getNodeId());
             disconnect();
             scheduler.shutdownNow();
+            healthScheduler.shutdownNow();
             messageExecutor.shutdownNow();
         }
         callback.run();
@@ -261,6 +293,7 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
         }
 
         stopHeartbeat();
+        stopHealthReporting();
         webSocket = null;
         log.info("Disconnected from InfraMesh Console");
         scheduleReconnect();
@@ -344,6 +377,50 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
         send(newEnvelope(NodeMessageType.HEARTBEAT, null, new NodeHeartbeat()));
     }
 
+    // ------------------------------------------------------------------
+    // Health reporting
+    // ------------------------------------------------------------------
+
+    // The first HEALTH goes out right after (re)connect so Console does not wait a full interval
+    // to learn the node's runtime health.
+    private void startHealthReporting() {
+        stopHealthReporting();
+        Duration interval = properties.getOutbound().getHealthInterval();
+        if (healthSource == null || interval == null || interval.isZero() || interval.isNegative()) {
+            return;
+        }
+        long intervalMillis = interval.toMillis();
+        healthTask = healthScheduler.scheduleAtFixedRate(
+                this::sendHealth, 0, intervalMillis, TimeUnit.MILLISECONDS);
+    }
+
+    private void stopHealthReporting() {
+        ScheduledFuture<?> task = healthTask;
+        if (task != null) {
+            task.cancel(false);
+            healthTask = null;
+        }
+    }
+
+    private void sendHealth() {
+        if (state.get() != NodeConnectionState.CONNECTED) {
+            return;
+        }
+
+        NodeHealthResponse health;
+        try {
+            health = healthSource.get();
+        } catch (RuntimeException e) {
+            // A failing collector must not cancel the periodic task (an exception escaping
+            // scheduleAtFixedRate would) - skip this report and try again next interval.
+            log.warn("Failed to collect node health, skipping HEALTH report: {}", e.toString());
+            return;
+        }
+
+        // send() re-checks the state, so a report collected while the connection dropped is skipped.
+        send(newEnvelope(NodeMessageType.HEALTH, null, health));
+    }
+
     private <T> NodeEnvelope<T> newEnvelope(NodeMessageType type, String requestId, T payload) {
         return new NodeEnvelope<>(
                 UUID.randomUUID().toString(), type, properties.getNodeId(), Instant.now(), requestId, payload);
@@ -384,6 +461,7 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
             state.set(NodeConnectionState.CONNECTED);
             log.info("Connected to InfraMesh Console, nodeId={}", properties.getNodeId());
             startHeartbeat();
+            startHealthReporting();
             webSocket.request(1);
         }
 

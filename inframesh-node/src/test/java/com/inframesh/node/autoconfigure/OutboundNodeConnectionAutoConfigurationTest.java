@@ -4,6 +4,7 @@ import com.inframesh.node.connection.NodeConnectionProperties;
 import com.inframesh.node.connection.NodeRequestHandler;
 import com.inframesh.node.connection.OutboundNodeConnection;
 import com.inframesh.node.connection.WebSocketOutboundNodeConnection;
+import com.inframesh.node.service.NodeHealthService;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -47,6 +48,7 @@ class OutboundNodeConnectionAutoConfigurationTest {
                 .withPropertyValues(OUTBOUND_PROPERTIES)
                 .withPropertyValues(
                         "inframesh.node.outbound.heartbeat-interval=15s",
+                        "inframesh.node.outbound.health-interval=45s",
                         "inframesh.node.outbound.reconnect.initial-delay=2s",
                         "inframesh.node.outbound.reconnect.max-delay=45s")
                 .run(context -> {
@@ -58,6 +60,7 @@ class OutboundNodeConnectionAutoConfigurationTest {
                     assertThat(properties.getNodeId().toString()).isEqualTo("1b4e28ba-2fa1-11d2-883f-0016d3cca427");
                     assertThat(properties.getCredential()).isEqualTo("test-credential");
                     assertThat(properties.getOutbound().getHeartbeatInterval().toSeconds()).isEqualTo(15);
+                    assertThat(properties.getOutbound().getHealthInterval().toSeconds()).isEqualTo(45);
                     assertThat(properties.getOutbound().getReconnect().getInitialDelay().toSeconds()).isEqualTo(2);
                     assertThat(properties.getOutbound().getReconnect().getMaxDelay().toSeconds()).isEqualTo(45);
                 });
@@ -70,6 +73,7 @@ class OutboundNodeConnectionAutoConfigurationTest {
                 .run(context -> {
                     NodeConnectionProperties properties = context.getBean(NodeConnectionProperties.class);
                     assertThat(properties.getOutbound().getHeartbeatInterval().toSeconds()).isEqualTo(10);
+                    assertThat(properties.getOutbound().getHealthInterval().toSeconds()).isEqualTo(30);
                     assertThat(properties.getOutbound().getReconnect().getInitialDelay().toSeconds()).isEqualTo(1);
                     assertThat(properties.getOutbound().getReconnect().getMaxDelay().toSeconds()).isEqualTo(30);
                 });
@@ -82,6 +86,20 @@ class OutboundNodeConnectionAutoConfigurationTest {
                 .withBean(NodeRequestHandler.class, () -> NodeRequestHandler.of(String.class, request -> request))
                 .run(context -> {
                     assertThat(context).hasNotFailed();
+                    assertThat(context.getBean(WebSocketOutboundNodeConnection.class).isRunning()).isTrue();
+                });
+    }
+
+    @Test
+    void outboundMode_withNodeAutoConfiguration_startsWithNodeHealthServiceAsHealthSource() {
+        // NodeAutoConfiguration provides the same NodeHealthService behind DIRECT's /api/v1/health.
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(
+                        NodeAutoConfiguration.class, OutboundNodeConnectionAutoConfiguration.class))
+                .withPropertyValues(OUTBOUND_PROPERTIES)
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).hasSingleBean(NodeHealthService.class);
                     assertThat(context.getBean(WebSocketOutboundNodeConnection.class).isRunning()).isTrue();
                 });
     }
