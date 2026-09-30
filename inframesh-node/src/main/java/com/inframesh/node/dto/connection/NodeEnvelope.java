@@ -32,11 +32,24 @@ public record NodeEnvelope<T>(
         Instant timestamp,
 
         /**
-         * Correlates a request with its response on the connection. Unique
-         * per request and unrelated to the inference {@code sessionId}.
+         * Correlates every message of one request lifecycle on the connection:
+         * a REQUEST with its RESPONSE/ERROR, and a STREAM_REQUEST with all of its
+         * STREAM_CHUNKs and its STREAM_COMPLETE/STREAM_ERROR. A CANCEL carries the
+         * requestId of the request to cancel. Unique per request and unrelated to
+         * the inference {@code sessionId}; {@code null} on messages that belong to
+         * no request (HEARTBEAT, HEALTH, ...).
          */
         String requestId,
 
         T payload
 ) {
+
+    /**
+     * Creates an envelope with a fresh {@code messageId} and the current
+     * timestamp - every message, e.g. each chunk of a stream, gets its own
+     * messageId while sharing the request's {@code requestId}.
+     */
+    public static <T> NodeEnvelope<T> create(NodeMessageType type, UUID nodeId, String requestId, T payload) {
+        return new NodeEnvelope<>(UUID.randomUUID().toString(), type, nodeId, Instant.now(), requestId, payload);
+    }
 }

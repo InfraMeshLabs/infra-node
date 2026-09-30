@@ -172,9 +172,14 @@ NodeConnectionMode        DIRECT / OUTBOUND
 NodeConnectionState       CONNECTED / DISCONNECTED / RECONNECTING
 NodeRegistrationRequest   registrationToken, name, nodeType
 NodeRegistrationResponse  nodeId, credential
-NodeMessageType           CONNECT, CONNECT_ACK, HEARTBEAT, HEARTBEAT_ACK, REQUEST, RESPONSE, ERROR
+NodeMessageType           CONNECT, CONNECT_ACK, HEARTBEAT, HEARTBEAT_ACK, HEALTH, HEALTH_ACK,
+                          REQUEST, RESPONSE, STREAM_REQUEST, STREAM_CHUNK, STREAM_COMPLETE,
+                          STREAM_ERROR, CANCEL, ERROR
 NodeEnvelope<T>           messageId, type, nodeId, timestamp, requestId, payload
 NodeHeartbeat             (empty; heartbeat time is NodeEnvelope.timestamp)
+NodeStreamChunk<T>        sequence, data
+NodeStreamComplete        chunkCount
+NodeError                 code, message
 ```
 
 Flow:
@@ -197,8 +202,47 @@ nodeId + credential ──▶ Connection handshake ──▶ NodeEnvelope<NodeHe
   (`CONNECTED != HEALTHY`).
 - A node sends `NodeEnvelope<NodeHeartbeat>` periodically over its connection to signal it is
   still alive.
-- A `REQUEST` is answered by exactly one `RESPONSE` (success) or `ERROR` (payload
-  `{"message": ...}`) carrying the same `requestId`.
+- A `REQUEST` is answered by exactly one `RESPONSE` (success) or `ERROR` (payload `NodeError`,
+  `{"code": ..., "message": ...}`) carrying the same `requestId`.
+
+### Streaming
+
+Streaming inference has its own lifecycle; non-streaming `REQUEST`/`RESPONSE` is unchanged.
+
+```text
+Non-streaming   REQUEST ──▶ RESPONSE | ERROR
+Streaming       STREAM_REQUEST ──▶ STREAM_CHUNK* ──▶ STREAM_COMPLETE | STREAM_ERROR
+Cancellation    CANCEL (Console ──▶ node)
+```
+
+Every message of one request lifecycle carries that request's `NodeEnvelope.requestId`; each
+message still has its own `messageId`:
+
+```text
+STREAM_REQUEST   messageId=M1  requestId=R1  payload=WorkerRequest
+STREAM_CHUNK     messageId=M2  requestId=R1  payload={"sequence":0,"data":ChatStreamResponse}
+STREAM_CHUNK     messageId=M3  requestId=R1  payload={"sequence":1,"data":ChatStreamResponse}
+STREAM_COMPLETE  messageId=M4  requestId=R1  payload={"chunkCount":2}
+```
+
+| Type | Direction | Payload | Meaning |
+| --- | --- | --- | --- |
+| `STREAM_REQUEST` | Console → Worker | `WorkerRequest` (same as `REQUEST` and DIRECT) | Start a streaming inference. |
+| `STREAM_CHUNK` | Worker → Console | `NodeStreamChunk<ChatStreamResponse>` | One part of the result. `data` is the same `ChatStreamResponse` DIRECT streams. `sequence` starts at `0` and increases by exactly `1` per chunk within a request. |
+| `STREAM_COMPLETE` | Worker → Console | `NodeStreamComplete` | Normal end. `chunkCount` = number of chunks sent. Finish reason / usage stay in the last chunk's `data`, as in DIRECT. |
+| `STREAM_ERROR` | Worker → Console | `NodeError` | The stream failed and ends here (possibly after some chunks). |
+| `CANCEL` | Console → Worker | none | Stop the in-flight request whose `requestId` the envelope carries. Not streaming-specific. |
+
+- Exactly one of `STREAM_COMPLETE` / `STREAM_ERROR` ends a stream. After sending `CANCEL`,
+  Console treats the request as finished and ignores any later message with its `requestId`; the
+  Worker need not acknowledge. A `CANCEL` for an unknown or finished request is a no-op.
+- `ERROR` keeps its meaning: protocol/connection errors and failures of non-streaming `REQUEST`s.
+  `STREAM_ERROR` is always scoped to a stream.
+- `NodeError.message` is a short client-safe description - never a stack trace, credential or
+  internal detail.
+- There is no per-chunk acknowledgement. Flow control is what the transport provides: the SDK's
+  `send` blocks until the frame is handed to the socket (sends are serialized), so a Worker
+  sending chunks from its handler thread is slowed down by a slow connection.
 
 ## Outbound Node Connection
 
@@ -256,7 +300,8 @@ inframesh:
     credential: ${INFRAMESH_NODE_CREDENTIAL}   # NodeRegistrationResponse.credential
 
     outbound:
-      heartbeat-interval: 10s                  # default 10s
+      heartbeat-interval: 10s                  # default 10s - connection liveness (HEARTBEAT)
+      health-interval: 30s                     # default 30s - runtime health (HEALTH)
 
       reconnect:
         initial-delay: 1s                      # default 1s
@@ -289,7 +334,49 @@ or other in-flight requests. A node that defines no `NodeRequestHandler` still c
 heartbeats; it rejects `REQUEST`s with an `ERROR` so Console does not wait for a timeout.
 
 `NodeMessageHandler` beans receive every other inbound envelope type (`NodeEnvelope<JsonNode>`,
-payload left as raw JSON) for protocol messages beyond REQUEST/RESPONSE.
+payload left as raw JSON) for protocol messages beyond REQUEST/RESPONSE - including
+`STREAM_REQUEST` and `CANCEL`. The SDK holds no streaming state: a Worker serves a
+`STREAM_REQUEST` in its handler (each call runs on its own thread and may block for the whole
+stream) and sends the chunks itself, cancelling on `CANCEL`:
+
+```java
+// Worker: streaming inference (sketch)
+@Bean
+NodeMessageHandler streamingHandler(OutboundNodeConnection connection, NodeConnectionProperties properties,
+                                    JsonMapper jsonMapper, WorkerService workerService) {
+    return envelope -> {
+        if (envelope.type() != NodeMessageType.STREAM_REQUEST) {
+            return; // CANCEL: look up the in-flight stream by envelope.requestId() and dispose it
+        }
+        UUID nodeId = properties.getNodeId();
+        String requestId = envelope.requestId();
+        WorkerRequest request = jsonMapper.treeToValue(envelope.payload(), WorkerRequest.class);
+        AtomicLong sequence = new AtomicLong();
+        try {
+            workerService.stream(request).toIterable().forEach(chunk -> connection.send(NodeEnvelope.create(
+                    NodeMessageType.STREAM_CHUNK, nodeId, requestId, new NodeStreamChunk<>(sequence.getAndIncrement(), chunk))));
+            connection.send(NodeEnvelope.create(
+                    NodeMessageType.STREAM_COMPLETE, nodeId, requestId, new NodeStreamComplete(sequence.get())));
+        } catch (RuntimeException e) {
+            connection.send(NodeEnvelope.create(
+                    NodeMessageType.STREAM_ERROR, nodeId, requestId, new NodeError("INFERENCE_FAILED", "Inference failed")));
+        }
+    };
+}
+```
+
+`NodeEnvelope.create(type, nodeId, requestId, payload)` fills a fresh `messageId` and the current
+timestamp.
+
+### Health reporting
+
+While connected, the SDK pushes a `HEALTH` envelope every `health-interval` (and once right after
+each connect/reconnect). Its payload is `NodeHealthResponse` from the same `NodeHealthService` that
+serves DIRECT's `GET /api/v1/health`, so Worker and Router report identical payloads; Console
+already knows the node type from the handshake. `HEARTBEAT` (connection alive) and `HEALTH`
+(node runtime health) are separate - `CONNECTED != HEALTHY`. No HEALTH is sent while disconnected,
+reporting restarts on reconnect and stops on shutdown. A `HEALTH_ACK` from Console reaches
+`NodeMessageHandler`s like any other message and does not change connection state.
 
 To send an envelope yourself, inject `OutboundNodeConnection` (`connect`, `disconnect`,
 `isConnected`, `send(NodeEnvelope)`).
