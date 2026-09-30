@@ -25,7 +25,7 @@ mavenPublishing {
 
     pom {
         name = 'InfraMesh Node'
-        description = 'Spring Boot auto-configuration module for node-level health monitoring (CPU/GPU/memory), and chat inference routing used across the InfraMesh platform (Console, Router, Worker).'
+        description = 'Common contracts and Spring Boot auto-configured node infrastructure - health monitoring (CPU/GPU/memory), API key authentication, and the outbound Console connection SDK - used across the InfraMesh platform (Console, Router, Worker).'
         url = 'https://github.com/InfraMeshLabs/infra-node'
 
         licenses {

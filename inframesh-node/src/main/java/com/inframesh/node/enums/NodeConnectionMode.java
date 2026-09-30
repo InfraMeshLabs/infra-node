@@ -11,8 +11,9 @@ public enum NodeConnectionMode {
     DIRECT,
 
     /**
-     * The node opens a persistent connection to Console.
-     * Protocol contract only; no runtime is provided by infra-node.
+     * The node opens a persistent connection to Console. The connection runtime
+     * is provided by infra-node's Outbound Connection SDK
+     * ({@code com.inframesh.node.connection}).
      */
     OUTBOUND
 }

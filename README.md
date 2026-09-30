@@ -2,7 +2,10 @@
 
 Core SDK and common protocol contracts for building **Router** and **Worker** nodes in the **InfraMesh distributed AI inference network**.
 
-`infra-node` provides the shared DTOs, health monitoring, authentication, and integration components used by InfraMesh Console, Router, and Worker implementations.
+`infra-node` provides two things:
+
+- **Common Contract** — the shared DTOs and protocol enums used by InfraMesh Console, Router, and Worker implementations.
+- **Common Node Infrastructure** — health monitoring, API key authentication, and the **Outbound Connection SDK** that every Router and Worker node reuses instead of implementing its own Console connection.
 
 ## Overview
 
@@ -33,7 +36,7 @@ InfraMesh coordinates distributed GPU and CPU resources for AI inference.
 - **Console** — Manages nodes, routing strategies, and inference orchestration.
 - **Router** — Optionally selects a Worker from candidates supplied by Console.
 - **Worker** — Executes AI inference using a configured runtime.
-- **infra-node** — Provides the common SDK and protocol contracts shared between components.
+- **infra-node** — Provides the common protocol contracts and the node infrastructure (health, authentication, outbound connection) shared between components.
 
 A Router is optional when Console uses a built-in routing strategy.
 
@@ -43,6 +46,7 @@ A Router is optional when Console uses a built-in routing strategy.
 - Shared inference and chat DTOs
 - Tool calling contracts
 - Node registration and outbound connection protocol contracts
+- Outbound Node Connection SDK (persistent WebSocket connection to Console for Router and Worker nodes)
 - Node health monitoring
 - CPU and memory monitoring
 - NVIDIA GPU monitoring
@@ -148,18 +152,17 @@ Session creation and Worker affinity are managed by Console.
 
 ## Node Registration & Connection Protocol
 
-> **Contract only.** `infra-node` defines the DTOs and enums below. Registration handling,
-> credential issuance, outbound connections, connection lifecycle, reconnect, and heartbeat
-> are **not implemented** yet — they belong to the Console, Router, and Worker runtimes.
-
-Today Console calls Router and Worker nodes directly over HTTP (`DIRECT`). A future
-`OUTBOUND` mode lets nodes open a persistent connection to Console, so they do not need
-to expose a public IP or port.
+Console reaches a node in one of two connection modes. Both coexist; `DIRECT` remains the default.
 
 ```text
 DIRECT     Console ──HTTP──▶ Router / Worker
-OUTBOUND   Router / Worker ──Persistent Connection──▶ Console   (planned)
+OUTBOUND   Router / Worker ──Persistent WebSocket──▶ Console
 ```
+
+`OUTBOUND` lets a node open a persistent connection to Console, so it does not need to expose a
+public IP or port. Console-side handling (registration, credential issuance, connection
+management, request dispatch) lives in `infra-console`; the node-side connection runtime is the
+[Outbound Node Connection](#outbound-node-connection) SDK below.
 
 Contracts:
 
@@ -174,7 +177,7 @@ NodeEnvelope<T>           messageId, type, nodeId, timestamp, requestId, payload
 NodeHeartbeat             (empty; heartbeat time is NodeEnvelope.timestamp)
 ```
 
-Intended flow:
+Flow:
 
 ```text
 registrationToken ──▶ Registration ──▶ nodeId + credential
@@ -190,9 +193,118 @@ nodeId + credential ──▶ Connection handshake ──▶ NodeEnvelope<NodeHe
   (`NodeRegistrationResponse.nodeId`). Once a connection is authenticated to a nodeId, the
   receiving side must verify every `NodeEnvelope.nodeId` on that connection matches — it must
   never trust the value as sent.
-- `NodeConnectionState` describes the connection only and is independent of node health.
+- `NodeConnectionState` describes the connection only and is independent of node health
+  (`CONNECTED != HEALTHY`).
 - A node sends `NodeEnvelope<NodeHeartbeat>` periodically over its connection to signal it is
   still alive.
+- A `REQUEST` is answered by exactly one `RESPONSE` (success) or `ERROR` (payload
+  `{"message": ...}`) carrying the same `requestId`.
+
+## Outbound Node Connection
+
+`infra-node` provides reusable outbound connection infrastructure for Router and Worker nodes.
+
+It provides:
+
+- WebSocket connection lifecycle
+- Node credential authentication
+- Heartbeat
+- Automatic reconnect
+- Exponential backoff and jitter
+- Graceful shutdown
+- NodeEnvelope transport
+- Generic message dispatch
+
+A node implementation only supplies its business logic — inference for a Worker, a routing
+decision for a Router. It never implements a WebSocket client, heartbeat, reconnect, or
+authentication itself.
+
+```text
+                         infra-node
+                             │
+                  Outbound Connection SDK
+                             │
+          ┌──────────────────┴──────────────────┐
+          │                                     │
+     infra-worker                          infra-router
+          │                                     │
+   Inference Logic                        Routing Logic
+          │                                     │
+          └──────────────────┬──────────────────┘
+                             │
+                    Persistent WebSocket
+                             │
+                             ▼
+                        infra-console
+```
+
+### Enabling
+
+The SDK is auto-configured (`OutboundNodeConnectionAutoConfiguration`) **only** when
+`inframesh.node.connection-mode=OUTBOUND`. With the property absent or set to `DIRECT`, no
+connection bean is created and no WebSocket client starts — existing DIRECT nodes need no new
+configuration.
+
+Worker and Router use the same `inframesh.node.*` properties:
+
+```yaml
+inframesh:
+  node:
+    connection-mode: OUTBOUND
+    console-url: ${INFRAMESH_CONSOLE_URL}      # http(s):// or ws(s)://
+    node-id: ${INFRAMESH_NODE_ID}              # NodeRegistrationResponse.nodeId
+    credential: ${INFRAMESH_NODE_CREDENTIAL}   # NodeRegistrationResponse.credential
+
+    outbound:
+      heartbeat-interval: 10s                  # default 10s
+
+      reconnect:
+        initial-delay: 1s                      # default 1s
+        max-delay: 30s                         # default 30s
+```
+
+### Serving requests
+
+Register a `NodeRequestHandler` bean. The SDK deserializes the `REQUEST` payload into the type you
+declare, runs the handler off the WebSocket listener thread, and answers with a `RESPONSE`
+(or an `ERROR` if the handler throws or the payload is malformed) carrying the same `requestId`.
+The SDK never interprets what the payload means.
+
+```java
+// Worker: inference
+@Bean
+NodeRequestHandler<WorkerRequest, ChatResponse> outboundRequestHandler(WorkerService workerService) {
+    return NodeRequestHandler.of(WorkerRequest.class, workerService::invoke);
+}
+
+// Router: routing decision
+@Bean
+NodeRequestHandler<RoutingRequest, RoutingResponse> outboundRequestHandler(RouterService routerService) {
+    return NodeRequestHandler.of(RoutingRequest.class, routerService::route);
+}
+```
+
+The handler may block (for example `.block()` on a reactive service) without delaying heartbeats
+or other in-flight requests. A node that defines no `NodeRequestHandler` still connects and
+heartbeats; it rejects `REQUEST`s with an `ERROR` so Console does not wait for a timeout.
+
+`NodeMessageHandler` beans receive every other inbound envelope type (`NodeEnvelope<JsonNode>`,
+payload left as raw JSON) for protocol messages beyond REQUEST/RESPONSE.
+
+To send an envelope yourself, inject `OutboundNodeConnection` (`connect`, `disconnect`,
+`isConnected`, `send(NodeEnvelope)`).
+
+### Behavior
+
+| Concern | Behavior |
+| --- | --- |
+| Endpoint | `ws(s)://<console-url host>/ws/v1/nodes/connect` (`http`→`ws`, `https`→`wss`) |
+| Authentication | `X-Infra-Node-Id` and `X-Infra-Node-Credential` handshake headers. The credential never appears in the URL, a query parameter, a `NodeEnvelope`, a heartbeat, a log line, or an exception message. |
+| Lifecycle | Spring `SmartLifecycle`: connects when the context starts. A connection failure never fails startup — it is logged and retried. |
+| Heartbeat | `NodeEnvelope<NodeHeartbeat>` every `heartbeat-interval` while connected; stopped on disconnect, restarted after reconnect. |
+| Reconnect | Exponential backoff with full jitter: attempt `n` waits a random delay in `[initial-delay, min(initial-delay × 2ⁿ, max-delay)]`. Same `nodeId`/`credential`; never re-registers. Concurrent close/error/handshake-failure events schedule a single reconnect. |
+| Connection identity | A late `RESPONSE` for a `REQUEST` received on a connection that has since been replaced is dropped rather than sent over the new connection. Late events from a replaced connection do not affect the current one. |
+| Shutdown | Forbid reconnects → cancel a pending reconnect → stop heartbeat → close the socket. A handshake that completes after shutdown began is closed immediately instead of reviving the connection. |
 
 ## Node Health
 

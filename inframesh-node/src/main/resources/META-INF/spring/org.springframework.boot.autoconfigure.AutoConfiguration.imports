@@ -1,1 +1,2 @@
 com.inframesh.node.autoconfigure.NodeAutoConfiguration
+com.inframesh.node.autoconfigure.OutboundNodeConnectionAutoConfiguration
