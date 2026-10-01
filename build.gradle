@@ -3,7 +3,7 @@ plugins {
 }
 
 allprojects {
-    group = 'io.github.inframeshlabs'
+    group = 'io.github.inframeshai'
     version = '0.1.0'
 
     repositories {
