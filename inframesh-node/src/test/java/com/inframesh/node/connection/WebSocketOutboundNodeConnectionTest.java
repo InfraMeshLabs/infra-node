@@ -5,6 +5,9 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.inframesh.node.dto.NodeHealthResponse;
 import com.inframesh.node.dto.connection.NodeEnvelope;
+import com.inframesh.node.dto.connection.NodeError;
+import com.inframesh.node.dto.connection.NodeStreamChunk;
+import com.inframesh.node.dto.connection.NodeStreamComplete;
 import com.inframesh.node.enums.NodeStatus;
 import com.inframesh.node.enums.NodeConnectionMode;
 import com.inframesh.node.enums.NodeConnectionState;
@@ -348,7 +351,7 @@ class WebSocketOutboundNodeConnectionTest {
         server.sendTextFrame(requestFrame(nodeId, "req-1", "world"));
 
         String response = awaitFrameContaining("\"type\":\"ERROR\"");
-        assertThat(response).contains("\"requestId\":\"req-1\"");
+        assertThat(response).contains("\"requestId\":\"req-1\"").contains("\"code\":\"UNSUPPORTED_REQUEST\"");
     }
 
     @Test
@@ -367,7 +370,7 @@ class WebSocketOutboundNodeConnectionTest {
 
         String response = awaitFrameContaining("\"type\":\"ERROR\"");
         assertThat(response).contains("\"requestId\":\"req-1\"");
-        assertThat(response).contains("handler blew up");
+        assertThat(response).contains("\"code\":\"REQUEST_FAILED\"").contains("handler blew up");
     }
 
     @Test
@@ -384,7 +387,8 @@ class WebSocketOutboundNodeConnectionTest {
                 + "\",\"requestId\":\"req-1\",\"payload\":\"not-an-object\"}");
 
         String response = awaitFrameContaining("\"type\":\"ERROR\"");
-        assertThat(response).contains("\"requestId\":\"req-1\"").contains("Malformed request payload");
+        assertThat(response).contains("\"requestId\":\"req-1\"").contains("\"code\":\"MALFORMED_PAYLOAD\"")
+                .contains("Malformed request payload");
     }
 
     @Test
@@ -544,6 +548,97 @@ class WebSocketOutboundNodeConnectionTest {
     // ------------------------------------------------------------------
     // HEALTH reporting
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Streaming / cancel - transported, never interpreted, by the SDK
+    // ------------------------------------------------------------------
+
+    @Test
+    void streamRequest_reachesMessageHandlers_andStreamMessagesAreSentWithSameRequestId() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        AtomicInteger requestHandlerCalls = new AtomicInteger();
+        // A Worker-like handler: serves STREAM_REQUEST by sending chunks, then STREAM_COMPLETE.
+        NodeMessageHandler streamingWorker = envelope -> {
+            if (envelope.type() != NodeMessageType.STREAM_REQUEST) {
+                return;
+            }
+            EchoRequest request = JsonMapper.shared().treeToValue(envelope.payload(), EchoRequest.class);
+            String[] parts = request.text().split(" ");
+            for (int i = 0; i < parts.length; i++) {
+                connection.send(NodeEnvelope.create(NodeMessageType.STREAM_CHUNK, nodeId, envelope.requestId(),
+                        new NodeStreamChunk<>(i, new EchoResponse(parts[i]))));
+            }
+            connection.send(NodeEnvelope.create(NodeMessageType.STREAM_COMPLETE, nodeId, envelope.requestId(),
+                    new NodeStreamComplete(parts.length)));
+        };
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId)
+                .requestHandler(NodeRequestHandler.of(EchoRequest.class, request -> {
+                    requestHandlerCalls.incrementAndGet();
+                    return new EchoResponse(request.text());
+                }))
+                .messageHandlers(List.of(streamingWorker)));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        server.sendTextFrame(JsonMapper.shared().writeValueAsString(NodeEnvelope.create(
+                NodeMessageType.STREAM_REQUEST, nodeId, "req-s", new EchoRequest("a b c"))));
+
+        List<JsonNode> chunks = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            chunks.add(JsonMapper.shared().readTree(awaitFrameContaining("\"type\":\"STREAM_CHUNK\"")));
+        }
+        JsonNode complete = JsonMapper.shared().readTree(awaitFrameContaining("\"type\":\"STREAM_COMPLETE\""));
+
+        assertThat(chunks).allSatisfy(chunk -> assertThat(chunk.get("requestId").asString()).isEqualTo("req-s"));
+        assertThat(chunks.stream().map(chunk -> chunk.get("payload").get("sequence").asLong()).toList())
+                .containsExactly(0L, 1L, 2L);
+        assertThat(chunks.stream().map(chunk -> chunk.get("payload").get("data").get("echoed").asString()).toList())
+                .containsExactly("a", "b", "c");
+        assertThat(chunks.stream().map(chunk -> chunk.get("messageId").asString()).distinct().count()).isEqualTo(3);
+        assertThat(complete.get("requestId").asString()).isEqualTo("req-s");
+        assertThat(complete.get("payload").get("chunkCount").asLong()).isEqualTo(3);
+        // STREAM_REQUEST is not a REQUEST: the non-streaming handler is untouched and no RESPONSE is sent.
+        assertThat(requestHandlerCalls.get()).isZero();
+    }
+
+    @Test
+    void streamError_isSentWithRequestIdAndErrorPayload() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        connection.send(NodeEnvelope.create(NodeMessageType.STREAM_ERROR, nodeId, "req-s",
+                new NodeError("RUNTIME_UNAVAILABLE", "Model runtime is not reachable")));
+
+        JsonNode frame = JsonMapper.shared().readTree(awaitFrameContaining("\"type\":\"STREAM_ERROR\""));
+        assertThat(frame.get("requestId").asString()).isEqualTo("req-s");
+        assertThat(frame.get("payload").get("code").asString()).isEqualTo("RUNTIME_UNAVAILABLE");
+        assertThat(frame.get("payload").get("message").asString()).isEqualTo("Model runtime is not reachable");
+    }
+
+    @Test
+    void cancel_reachesMessageHandlersWithTargetRequestId() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        BlockingQueue<NodeEnvelope<JsonNode>> received = new LinkedBlockingQueue<>();
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId).messageHandlers(List.of(received::add)));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        server.sendTextFrame(JsonMapper.shared().writeValueAsString(
+                NodeEnvelope.create(NodeMessageType.CANCEL, nodeId, "req-s", null)));
+
+        NodeEnvelope<JsonNode> cancel = received.poll(5, TimeUnit.SECONDS);
+        assertThat(cancel).isNotNull();
+        assertThat(cancel.type()).isEqualTo(NodeMessageType.CANCEL);
+        assertThat(cancel.requestId()).isEqualTo("req-s");
+    }
 
     @Test
     void health_sentAsHealthEnvelopeCarryingNodeHealthResponse_separateFromHeartbeat() throws Exception {

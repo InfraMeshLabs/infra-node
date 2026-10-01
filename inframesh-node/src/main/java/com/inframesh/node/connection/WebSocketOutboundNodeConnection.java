@@ -2,6 +2,7 @@ package com.inframesh.node.connection;
 
 import com.inframesh.node.dto.NodeHealthResponse;
 import com.inframesh.node.dto.connection.NodeEnvelope;
+import com.inframesh.node.dto.connection.NodeError;
 import com.inframesh.node.dto.connection.NodeHeartbeat;
 import com.inframesh.node.enums.NodeConnectionState;
 import com.inframesh.node.enums.NodeMessageType;
@@ -17,10 +18,7 @@ import java.net.URISyntaxException;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.List;
-import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -425,8 +423,7 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
     }
 
     private <T> NodeEnvelope<T> newEnvelope(NodeMessageType type, String requestId, T payload) {
-        return new NodeEnvelope<>(
-                UUID.randomUUID().toString(), type, properties.getNodeId(), Instant.now(), requestId, payload);
+        return NodeEnvelope.create(type, properties.getNodeId(), requestId, payload);
     }
 
     private static ThreadFactory daemonThreads(String namePrefix) {
@@ -525,7 +522,7 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
         if (requestHandler == null) {
             log.warn("Received REQUEST but no NodeRequestHandler is configured, rejecting. requestId={}", requestId);
             sendIfSameConnection(webSocket, newEnvelope(NodeMessageType.ERROR, requestId,
-                    Map.of("message", "Node does not have an outbound request handler configured")));
+                    new NodeError(NodeError.UNSUPPORTED_REQUEST, "Node does not have an outbound request handler configured")));
             return;
         }
 
@@ -540,14 +537,16 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
             request = jsonMapper.treeToValue(envelope.payload(), handler.requestType());
         } catch (RuntimeException e) {
             log.warn("Failed to parse REQUEST payload, requestId={}", requestId, e);
-            return newEnvelope(NodeMessageType.ERROR, requestId, Map.of("message", "Malformed request payload"));
+            return newEnvelope(NodeMessageType.ERROR, requestId,
+                    new NodeError(NodeError.MALFORMED_PAYLOAD, "Malformed request payload"));
         }
 
         try {
             return newEnvelope(NodeMessageType.RESPONSE, requestId, handler.handle(request));
         } catch (RuntimeException e) {
             log.warn("Outbound request failed, requestId={}", requestId, e);
-            return newEnvelope(NodeMessageType.ERROR, requestId, Map.of("message", String.valueOf(e.getMessage())));
+            return newEnvelope(NodeMessageType.ERROR, requestId,
+                    new NodeError(NodeError.REQUEST_FAILED, String.valueOf(e.getMessage())));
         }
     }
 
