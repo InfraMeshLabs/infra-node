@@ -3,8 +3,10 @@ package com.inframesh.node.autoconfigure;
 import com.inframesh.node.connection.NodeConnectionProperties;
 import com.inframesh.node.connection.NodeMessageHandler;
 import com.inframesh.node.connection.NodeRequestHandler;
+import com.inframesh.node.connection.NodeStreamRequestHandler;
 import com.inframesh.node.connection.OutboundNodeConnection;
 import com.inframesh.node.connection.WebSocketOutboundNodeConnection;
+import com.inframesh.node.monitor.ActiveRequestCounter;
 import com.inframesh.node.service.NodeHealthService;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
@@ -29,21 +31,29 @@ public class OutboundNodeConnectionAutoConfiguration {
     /**
      * The {@link NodeRequestHandler} bean is optional: a node that opts into OUTBOUND but
      * defines none still connects and heartbeats normally - it just rejects REQUESTs with an
-     * ERROR instead of serving them. At most one may be defined.
+     * ERROR instead of serving them. At most one may be defined. The same goes for the
+     * {@link NodeStreamRequestHandler} bean: without one, STREAM_REQUEST and CANCEL are left to
+     * the {@link NodeMessageHandler}s.
      * <p>
      * HEALTH is reported from the same {@link NodeHealthService} behind DIRECT's
      * {@code GET /api/v1/health}, so Worker and Router push exactly the payload Console would
      * otherwise pull. Without that bean the node connects and heartbeats but reports no HEALTH.
+     * <p>
+     * The {@link ActiveRequestCounter} is the one {@link NodeHealthService} reads, so the Worker
+     * inference served over this connection shows up as {@code runtime.activeRequests}.
      */
     @Bean
     @ConditionalOnMissingBean
     public OutboundNodeConnection outboundNodeConnection(NodeConnectionProperties properties,
                                                          ObjectProvider<NodeRequestHandler<?, ?>> requestHandler,
+                                                         ObjectProvider<NodeStreamRequestHandler<?, ?>> streamRequestHandler,
                                                          ObjectProvider<NodeMessageHandler> messageHandlers,
-                                                         ObjectProvider<NodeHealthService> healthService) {
+                                                         ObjectProvider<NodeHealthService> healthService,
+                                                         ObjectProvider<ActiveRequestCounter> activeRequestCounter) {
         NodeHealthService health = healthService.getIfAvailable();
         return new WebSocketOutboundNodeConnection(
-                properties, requestHandler.getIfAvailable(), messageHandlers.orderedStream().toList(),
-                health != null ? health::getHealth : null);
+                properties, requestHandler.getIfAvailable(), streamRequestHandler.getIfAvailable(),
+                messageHandlers.orderedStream().toList(), health != null ? health::getHealth : null,
+                activeRequestCounter.getIfAvailable());
     }
 }

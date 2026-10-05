@@ -3,18 +3,23 @@ package com.inframesh.node.connection;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import com.inframesh.node.dto.ChatMessage;
 import com.inframesh.node.dto.NodeHealthResponse;
 import com.inframesh.node.dto.connection.NodeEnvelope;
 import com.inframesh.node.dto.connection.NodeError;
 import com.inframesh.node.dto.connection.NodeStreamChunk;
 import com.inframesh.node.dto.connection.NodeStreamComplete;
+import com.inframesh.node.dto.worker.WorkerRequest;
 import com.inframesh.node.enums.NodeStatus;
 import com.inframesh.node.enums.NodeConnectionMode;
 import com.inframesh.node.enums.NodeConnectionState;
 import com.inframesh.node.enums.NodeMessageType;
+import com.inframesh.node.monitor.ActiveRequestCounter;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Sinks;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -36,6 +41,7 @@ import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.IntSupplier;
 import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -640,6 +646,313 @@ class WebSocketOutboundNodeConnectionTest {
         assertThat(cancel.requestId()).isEqualTo("req-s");
     }
 
+    // ------------------------------------------------------------------
+    // ActiveRequestCounter - Worker inference served over OUTBOUND
+    // ------------------------------------------------------------------
+
+    @Test
+    void activeRequests_countWorkerRequestOnlyWhileHandlerRuns() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        ActiveRequestCounter counter = new ActiveRequestCounter();
+        CountDownLatch releaseHandler = new CountDownLatch(1);
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId).counter(counter)
+                .requestHandler(NodeRequestHandler.of(WorkerRequest.class, request -> {
+                    await(releaseHandler);
+                    return new EchoResponse("done");
+                })));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+        assertThat(counter.get()).isZero();
+
+        server.sendTextFrame(workerFrame(NodeMessageType.REQUEST, nodeId, "req-1", "a"));
+        awaitValue(counter::get, 1);
+
+        releaseHandler.countDown();
+        // The handler has returned by the time its RESPONSE is on the wire.
+        assertThat(awaitFrameContaining("\"type\":\"RESPONSE\"")).contains("\"requestId\":\"req-1\"");
+        assertThat(counter.get()).isZero();
+    }
+
+    @Test
+    void activeRequests_decrementedWhenWorkerHandlerThrows() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        ActiveRequestCounter counter = new ActiveRequestCounter();
+        AtomicInteger seenByHandler = new AtomicInteger(-1);
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId).counter(counter)
+                .requestHandler(NodeRequestHandler.of(WorkerRequest.class, request -> {
+                    seenByHandler.set(counter.get());
+                    throw new IllegalStateException("inference failed");
+                })));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        server.sendTextFrame(workerFrame(NodeMessageType.REQUEST, nodeId, "req-1", "a"));
+
+        assertThat(awaitFrameContaining("\"type\":\"ERROR\"")).contains("\"code\":\"REQUEST_FAILED\"");
+        assertThat(seenByHandler.get()).isEqualTo(1);
+        assertThat(counter.get()).isZero();
+    }
+
+    @Test
+    void activeRequests_trackConcurrentWorkerRequests() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        ActiveRequestCounter counter = new ActiveRequestCounter();
+        Map<String, CountDownLatch> release = Map.of("A", new CountDownLatch(1), "B", new CountDownLatch(1));
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId).counter(counter)
+                .requestHandler(NodeRequestHandler.of(WorkerRequest.class, request -> {
+                    String name = request.messages().get(0).content();
+                    await(release.get(name));
+                    return new EchoResponse(name);
+                })));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        server.sendTextFrame(workerFrame(NodeMessageType.REQUEST, nodeId, "req-A", "A"));
+        awaitValue(counter::get, 1);
+        server.sendTextFrame(workerFrame(NodeMessageType.REQUEST, nodeId, "req-B", "B"));
+        awaitValue(counter::get, 2);
+
+        release.get("A").countDown();
+        assertThat(awaitFrameContaining("\"type\":\"RESPONSE\"")).contains("\"requestId\":\"req-A\"");
+        assertThat(counter.get()).isEqualTo(1);
+
+        release.get("B").countDown();
+        assertThat(awaitFrameContaining("\"type\":\"RESPONSE\"")).contains("\"requestId\":\"req-B\"");
+        assertThat(counter.get()).isZero();
+    }
+
+    @Test
+    void activeRequests_notCountedForNonWorkerHandler() throws Exception {
+        // A Router serves RoutingRequest through the same NodeRequestHandler SPI; it runs no inference.
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        ActiveRequestCounter counter = new ActiveRequestCounter();
+        AtomicInteger seenByHandler = new AtomicInteger(-1);
+        AtomicInteger seenByStream = new AtomicInteger(-1);
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId).counter(counter)
+                .requestHandler(NodeRequestHandler.of(EchoRequest.class, request -> {
+                    seenByHandler.set(counter.get());
+                    return new EchoResponse(request.text());
+                }))
+                .streamRequestHandler(NodeStreamRequestHandler.of(EchoRequest.class, request -> {
+                    seenByStream.set(counter.get());
+                    return Flux.just(new EchoResponse(request.text()));
+                })));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        server.sendTextFrame(requestFrame(nodeId, "req-1", "route me"));
+        assertThat(awaitFrameContaining("\"type\":\"RESPONSE\"")).contains("route me");
+        server.sendTextFrame(JsonMapper.shared().writeValueAsString(NodeEnvelope.create(
+                NodeMessageType.STREAM_REQUEST, nodeId, "req-s", new EchoRequest("stream me"))));
+        awaitFrameContaining("\"type\":\"STREAM_COMPLETE\"");
+
+        assertThat(seenByHandler.get()).isZero();
+        assertThat(seenByStream.get()).isZero();
+        assertThat(counter.get()).isZero();
+    }
+
+    @Test
+    void activeRequests_coverWholeStreamUntilComplete() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        ActiveRequestCounter counter = new ActiveRequestCounter();
+        Sinks.Many<EchoResponse> sink = Sinks.many().unicast().onBackpressureBuffer();
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId).counter(counter)
+                .streamRequestHandler(NodeStreamRequestHandler.of(WorkerRequest.class, request -> sink.asFlux())));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        server.sendTextFrame(workerFrame(NodeMessageType.STREAM_REQUEST, nodeId, "req-s", "a"));
+        awaitValue(counter::get, 1);
+        awaitValue(sink::currentSubscriberCount, 1);
+
+        for (int i = 0; i < 3; i++) {
+            sink.tryEmitNext(new EchoResponse("chunk-" + i));
+            JsonNode chunk = JsonMapper.shared().readTree(awaitFrameContaining("\"type\":\"STREAM_CHUNK\""));
+            assertThat(chunk.get("requestId").asString()).isEqualTo("req-s");
+            assertThat(chunk.get("payload").get("sequence").asLong()).isEqualTo(i);
+            assertThat(chunk.get("payload").get("data").get("echoed").asString()).isEqualTo("chunk-" + i);
+            assertThat(counter.get()).isEqualTo(1);
+        }
+
+        sink.tryEmitComplete();
+        JsonNode complete = JsonMapper.shared().readTree(awaitFrameContaining("\"type\":\"STREAM_COMPLETE\""));
+        assertThat(complete.get("requestId").asString()).isEqualTo("req-s");
+        assertThat(complete.get("payload").get("chunkCount").asLong()).isEqualTo(3);
+        assertThat(counter.get()).isZero();
+    }
+
+    @Test
+    void activeRequests_decrementedWhenStreamFails() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        ActiveRequestCounter counter = new ActiveRequestCounter();
+        Sinks.Many<EchoResponse> sink = Sinks.many().unicast().onBackpressureBuffer();
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId).counter(counter)
+                .streamRequestHandler(NodeStreamRequestHandler.of(WorkerRequest.class, request -> sink.asFlux())));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        server.sendTextFrame(workerFrame(NodeMessageType.STREAM_REQUEST, nodeId, "req-s", "a"));
+        awaitValue(counter::get, 1);
+        awaitValue(sink::currentSubscriberCount, 1);
+
+        sink.tryEmitError(new IllegalStateException("runtime unreachable"));
+
+        JsonNode error = JsonMapper.shared().readTree(awaitFrameContaining("\"type\":\"STREAM_ERROR\""));
+        assertThat(error.get("requestId").asString()).isEqualTo("req-s");
+        assertThat(error.get("payload").get("code").asString()).isEqualTo("REQUEST_FAILED");
+        assertThat(counter.get()).isZero();
+    }
+
+    @Test
+    void activeRequests_decrementedWhenStreamHandlerThrows() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        ActiveRequestCounter counter = new ActiveRequestCounter();
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId).counter(counter)
+                .streamRequestHandler(NodeStreamRequestHandler.of(WorkerRequest.class, request -> {
+                    throw new IllegalStateException("cannot start inference");
+                })));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        server.sendTextFrame(workerFrame(NodeMessageType.STREAM_REQUEST, nodeId, "req-s", "a"));
+
+        assertThat(awaitFrameContaining("\"type\":\"STREAM_ERROR\"")).contains("cannot start inference");
+        assertThat(counter.get()).isZero();
+    }
+
+    @Test
+    void activeRequests_decrementedExactlyOnceWhenStreamIsCancelled() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        ActiveRequestCounter counter = new ActiveRequestCounter();
+        Sinks.Many<EchoResponse> sink = Sinks.many().unicast().onBackpressureBuffer();
+        CountDownLatch upstreamCancelled = new CountDownLatch(1);
+        BlockingQueue<NodeEnvelope<JsonNode>> seenByMessageHandler = new LinkedBlockingQueue<>();
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId).counter(counter)
+                .streamRequestHandler(NodeStreamRequestHandler.of(WorkerRequest.class,
+                        request -> sink.asFlux().doOnCancel(upstreamCancelled::countDown)))
+                .messageHandlers(List.of(seenByMessageHandler::add)));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        server.sendTextFrame(workerFrame(NodeMessageType.STREAM_REQUEST, nodeId, "req-s", "a"));
+        awaitValue(counter::get, 1);
+        awaitValue(sink::currentSubscriberCount, 1);
+        sink.tryEmitNext(new EchoResponse("chunk-0"));
+        awaitFrameContaining("\"type\":\"STREAM_CHUNK\"");
+
+        String cancel = JsonMapper.shared().writeValueAsString(
+                NodeEnvelope.create(NodeMessageType.CANCEL, nodeId, "req-s", null));
+        server.sendTextFrame(cancel);
+
+        // The CANCEL reaches the inference itself, and only that ends the active request.
+        assertThat(upstreamCancelled.await(5, TimeUnit.SECONDS)).isTrue();
+        awaitValue(counter::get, 0);
+
+        // Nothing that follows a finished stream may decrement again: a repeated CANCEL, a CANCEL
+        // for an unknown request, a late terminal signal from the source, or losing the connection.
+        server.sendTextFrame(cancel);
+        server.sendTextFrame(JsonMapper.shared().writeValueAsString(
+                NodeEnvelope.create(NodeMessageType.CANCEL, nodeId, "req-unknown", null)));
+        for (int i = 0; i < 3; i++) {
+            assertThat(seenByMessageHandler.poll(5, TimeUnit.SECONDS)).isNotNull(); // all three CANCELs handled
+        }
+        sink.tryEmitComplete();
+        connection.disconnect();
+
+        assertThat(counter.get()).isZero();
+        // A cancelled stream is not answered with STREAM_COMPLETE / STREAM_ERROR.
+        for (String frame = server.awaitTextFrame(1); frame != null; frame = server.awaitTextFrame(1)) {
+            assertThat(frame).doesNotContain("STREAM_COMPLETE").doesNotContain("STREAM_ERROR");
+        }
+    }
+
+    @Test
+    void activeRequests_decrementedWhenConnectionDropsMidStream() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        ActiveRequestCounter counter = new ActiveRequestCounter();
+        Sinks.Many<EchoResponse> sink = Sinks.many().unicast().onBackpressureBuffer();
+        CountDownLatch upstreamCancelled = new CountDownLatch(1);
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId).counter(counter)
+                .streamRequestHandler(NodeStreamRequestHandler.of(WorkerRequest.class,
+                        request -> sink.asFlux().doOnCancel(upstreamCancelled::countDown))));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        server.sendTextFrame(workerFrame(NodeMessageType.STREAM_REQUEST, nodeId, "req-s", "a"));
+        awaitValue(counter::get, 1);
+        awaitValue(sink::currentSubscriberCount, 1);
+
+        server.dropCurrentConnection();
+
+        assertThat(upstreamCancelled.await(5, TimeUnit.SECONDS)).isTrue();
+        awaitValue(counter::get, 0);
+    }
+
+    @Test
+    void streamRequestHandler_takesStreamRequestsFromMessageHandlers() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        BlockingQueue<NodeEnvelope<JsonNode>> seenByMessageHandler = new LinkedBlockingQueue<>();
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId)
+                .streamRequestHandler(NodeStreamRequestHandler.of(WorkerRequest.class,
+                        request -> Flux.just(new EchoResponse("only once"))))
+                .messageHandlers(List.of(seenByMessageHandler::add)));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        server.sendTextFrame(workerFrame(NodeMessageType.STREAM_REQUEST, nodeId, "req-s", "a"));
+        awaitFrameContaining("\"type\":\"STREAM_COMPLETE\"");
+        server.sendTextFrame("{\"messageId\":\"ack\",\"type\":\"HEARTBEAT_ACK\",\"nodeId\":\"" + nodeId + "\"}");
+
+        // Served by the SDK alone - a NodeMessageHandler serving it too would stream it twice.
+        assertThat(seenByMessageHandler.poll(5, TimeUnit.SECONDS).type()).isEqualTo(NodeMessageType.HEARTBEAT_ACK);
+    }
+
+    @Test
+    void health_reportsActiveRequestsWhileWorkerRequestIsRunning() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        ActiveRequestCounter counter = new ActiveRequestCounter();
+        CountDownLatch releaseHandler = new CountDownLatch(1);
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId).counter(counter)
+                .health(Duration.ofMillis(100), () -> new NodeHealthResponse(
+                        NodeStatus.UP, SAMPLE_HEALTH.system(), new NodeHealthResponse.RuntimeInfo(counter.get())))
+                .requestHandler(NodeRequestHandler.of(WorkerRequest.class, request -> {
+                    await(releaseHandler);
+                    return new EchoResponse("done");
+                })));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+        assertThat(awaitFrameContaining("\"type\":\"HEALTH\"")).contains("\"activeRequests\":0");
+
+        server.sendTextFrame(workerFrame(NodeMessageType.REQUEST, nodeId, "req-1", "a"));
+        assertThat(awaitFrameContaining("\"activeRequests\":1")).contains("\"type\":\"HEALTH\"");
+
+        releaseHandler.countDown();
+        awaitFrameContaining("\"type\":\"RESPONSE\"");
+        assertThat(awaitFrameContaining("\"type\":\"HEALTH\"")).contains("\"activeRequests\":0");
+    }
+
     @Test
     void health_sentAsHealthEnvelopeCarryingNodeHealthResponse_separateFromHeartbeat() throws Exception {
         UUID nodeId = UUID.randomUUID();
@@ -828,6 +1141,21 @@ class WebSocketOutboundNodeConnectionTest {
         return JsonMapper.shared().writeValueAsString(envelope);
     }
 
+    private String workerFrame(NodeMessageType type, UUID nodeId, String requestId, String content) {
+        return JsonMapper.shared().writeValueAsString(NodeEnvelope.create(type, nodeId, requestId,
+                new WorkerRequest(List.of(ChatMessage.user(content)), null)));
+    }
+
+    private static void awaitValue(IntSupplier actual, int expected) throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (actual.getAsInt() != expected) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("Timed out waiting for value=" + expected + ", was=" + actual.getAsInt());
+            }
+            Thread.sleep(10);
+        }
+    }
+
     // Heartbeats keep arriving on the same connection, so scan frames until one matches rather
     // than assuming the very next frame is the one we're waiting for.
     private String awaitFrameContaining(String needle) throws InterruptedException {
@@ -873,7 +1201,8 @@ class WebSocketOutboundNodeConnectionTest {
         properties.getOutbound().getReconnect().setInitialDelay(options.reconnectInitial);
         properties.getOutbound().getReconnect().setMaxDelay(options.reconnectMax);
         return new WebSocketOutboundNodeConnection(
-                properties, options.requestHandler, options.messageHandlers, options.healthSource);
+                properties, options.requestHandler, options.streamRequestHandler, options.messageHandlers,
+                options.healthSource, options.counter);
     }
 
     private static final class Options {
@@ -887,6 +1216,8 @@ class WebSocketOutboundNodeConnectionTest {
         private List<NodeMessageHandler> messageHandlers = List.of();
         private Duration healthInterval = Duration.ofSeconds(30);
         private Supplier<NodeHealthResponse> healthSource;
+        private NodeStreamRequestHandler<?, ?> streamRequestHandler;
+        private ActiveRequestCounter counter;
 
         private Options(String consoleUrl) {
             this.consoleUrl = consoleUrl;
@@ -915,6 +1246,16 @@ class WebSocketOutboundNodeConnectionTest {
 
         Options requestHandler(NodeRequestHandler<?, ?> value) {
             requestHandler = value;
+            return this;
+        }
+
+        Options streamRequestHandler(NodeStreamRequestHandler<?, ?> value) {
+            streamRequestHandler = value;
+            return this;
+        }
+
+        Options counter(ActiveRequestCounter value) {
+            counter = value;
             return this;
         }
 

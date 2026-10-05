@@ -333,37 +333,52 @@ The handler may block (for example `.block()` on a reactive service) without del
 or other in-flight requests. A node that defines no `NodeRequestHandler` still connects and
 heartbeats; it rejects `REQUEST`s with an `ERROR` so Console does not wait for a timeout.
 
-`NodeMessageHandler` beans receive every other inbound envelope type (`NodeEnvelope<JsonNode>`,
-payload left as raw JSON) for protocol messages beyond REQUEST/RESPONSE - including
-`STREAM_REQUEST` and `CANCEL`. The SDK holds no streaming state: a Worker serves a
-`STREAM_REQUEST` in its handler (each call runs on its own thread and may block for the whole
-stream) and sends the chunks itself, cancelling on `CANCEL`:
+### Serving streams
+
+Register a `NodeStreamRequestHandler` bean to serve `STREAM_REQUEST`. It returns a
+`org.reactivestreams.Publisher` (a Reactor `Flux` is one); the SDK owns the rest of the stream
+lifecycle: it subscribes, sends every element as a `STREAM_CHUNK` with an increasing `sequence`,
+and ends with `STREAM_COMPLETE`, or `STREAM_ERROR` if the publisher fails or the handler throws.
+A `CANCEL` for the stream's `requestId`, or losing the connection, cancels the subscription and
+sends nothing further.
 
 ```java
-// Worker: streaming inference (sketch)
+// Worker: streaming inference
 @Bean
-NodeMessageHandler streamingHandler(OutboundNodeConnection connection, NodeConnectionProperties properties,
-                                    JsonMapper jsonMapper, WorkerService workerService) {
-    return envelope -> {
-        if (envelope.type() != NodeMessageType.STREAM_REQUEST) {
-            return; // CANCEL: look up the in-flight stream by envelope.requestId() and dispose it
-        }
-        UUID nodeId = properties.getNodeId();
-        String requestId = envelope.requestId();
-        WorkerRequest request = jsonMapper.treeToValue(envelope.payload(), WorkerRequest.class);
-        AtomicLong sequence = new AtomicLong();
-        try {
-            workerService.stream(request).toIterable().forEach(chunk -> connection.send(NodeEnvelope.create(
-                    NodeMessageType.STREAM_CHUNK, nodeId, requestId, new NodeStreamChunk<>(sequence.getAndIncrement(), chunk))));
-            connection.send(NodeEnvelope.create(
-                    NodeMessageType.STREAM_COMPLETE, nodeId, requestId, new NodeStreamComplete(sequence.get())));
-        } catch (RuntimeException e) {
-            connection.send(NodeEnvelope.create(
-                    NodeMessageType.STREAM_ERROR, nodeId, requestId, new NodeError("INFERENCE_FAILED", "Inference failed")));
-        }
-    };
+NodeStreamRequestHandler<WorkerRequest, ChatStreamResponse> outboundStreamRequestHandler(WorkerService workerService) {
+    return NodeStreamRequestHandler.of(WorkerRequest.class, workerService::stream);
 }
 ```
+
+This needs `org.reactivestreams:reactive-streams` on the classpath (already there with Reactor /
+WebFlux). Nodes that register no `NodeStreamRequestHandler` do not need it.
+
+### Active requests
+
+`NodeHealthResponse.runtime.activeRequests` is the number of requests the Worker is running
+inference for right now - nothing else (not Console's in-flight count, a queue size, pending
+WebSocket messages or HTTP connections). For OUTBOUND the SDK maintains it through
+`ActiveRequestCounter`:
+
+| Message | Counted from | Until |
+| --- | --- | --- |
+| `REQUEST` | the `NodeRequestHandler` starts | it returns or throws (sending the `RESPONSE`/`ERROR` is not included) |
+| `STREAM_REQUEST` | the stream is accepted | the stream ends - complete, error or cancelled, exactly once |
+
+A `CANCEL` does not decrement by itself; it cancels the stream, and the stream ending does. Only
+handlers whose request type is `WorkerRequest` are counted, so a Router's
+`NodeRequestHandler<RoutingRequest, RoutingResponse>` never shows up as an active request. Do not
+increment `ActiveRequestCounter` again inside an OUTBOUND handler - that would count the request
+twice.
+
+### Other messages
+
+`NodeMessageHandler` beans receive every other inbound envelope type (`NodeEnvelope<JsonNode>`,
+payload left as raw JSON) for protocol messages beyond REQUEST/RESPONSE, `CANCEL` included.
+Without a `NodeStreamRequestHandler` they also receive `STREAM_REQUEST`, and a node can serve
+streams there itself by sending `STREAM_CHUNK`/`STREAM_COMPLETE`/`STREAM_ERROR` through
+`OutboundNodeConnection.send` - but the SDK cannot see where such a stream ends, so it is not
+counted in `activeRequests`.
 
 `NodeEnvelope.create(type, nodeId, requestId, payload)` fills a fresh `messageId` and the current
 timestamp.
@@ -445,7 +460,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.github.inframeshlabs:inframesh-node:0.1.0'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.1'
 }
 ```
 
@@ -453,9 +468,9 @@ dependencies {
 
 ```xml
 <dependency>
-    <groupId>io.github.inframeshlabs</groupId>
+    <groupId>io.github.inframeshai</groupId>
     <artifactId>inframesh-node</artifactId>
-    <version>0.1.0</version>
+    <version>0.1.1</version>
 </dependency>
 ```
 
@@ -482,7 +497,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.github.inframeshlabs:inframesh-node:0.1.0'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.1'
 }
 ```
 

@@ -4,8 +4,10 @@ import com.inframesh.node.dto.NodeHealthResponse;
 import com.inframesh.node.dto.connection.NodeEnvelope;
 import com.inframesh.node.dto.connection.NodeError;
 import com.inframesh.node.dto.connection.NodeHeartbeat;
+import com.inframesh.node.dto.worker.WorkerRequest;
 import com.inframesh.node.enums.NodeConnectionState;
 import com.inframesh.node.enums.NodeMessageType;
+import com.inframesh.node.monitor.ActiveRequestCounter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.SmartLifecycle;
@@ -39,7 +41,13 @@ import java.util.function.Supplier;
  * handshake authentication headers, heartbeat, HEALTH reporting, reconnect with
  * exponential backoff + jitter, graceful shutdown, {@link NodeEnvelope} (de)serialization,
  * and dispatch of inbound messages to {@link NodeRequestHandler} /
- * {@link NodeMessageHandler}. It never interprets business payloads.
+ * {@link NodeStreamRequestHandler} / {@link NodeMessageHandler}. It never
+ * interprets business payloads.
+ *
+ * It also keeps {@link ActiveRequestCounter} for the inference it runs: a
+ * handler serving {@code WorkerRequest} is counted from the moment it starts
+ * until it returns (REQUEST) or its stream ends (STREAM_REQUEST). Handlers for
+ * any other payload - a Router's routing decisions - are never counted.
  *
  * Registered as a {@link SmartLifecycle} bean so Spring starts it once the
  * application context is up and stops it - in the order required by the
@@ -73,6 +81,8 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
     private final NodeRequestHandler<?, ?> requestHandler;
     private final List<NodeMessageHandler> messageHandlers;
     private final Supplier<NodeHealthResponse> healthSource;
+    // Counts the REQUESTs being served; a detached counter nobody reads when they are not inference.
+    private final ActiveRequestCounter requestCounter;
     private final ReconnectBackoff backoff;
     private final HttpClient httpClient = HttpClient.newHttpClient();
     private final JsonMapper jsonMapper = JsonMapper.shared();
@@ -92,6 +102,9 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
     // heartbeat and RESPONSE sends can race from different threads, so every send is serialized
     // on this lock.
     private final Object sendLock = new Object();
+    // null unless a NodeStreamRequestHandler is configured; STREAM_REQUEST/CANCEL then go to
+    // NodeMessageHandlers only.
+    private final OutboundStreamRegistry<?, ?> streams;
 
     private final AtomicReference<NodeConnectionState> state =
             new AtomicReference<>(NodeConnectionState.DISCONNECTED);
@@ -113,7 +126,8 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
      * @param requestHandler  serves REQUESTs received over this connection; {@code null} if this node
      *                        does not serve requests over OUTBOUND (REQUESTs are then rejected with an
      *                        ERROR rather than silently ignored, so Console does not wait for a timeout).
-     * @param messageHandlers receive every inbound envelope other than REQUEST.
+     * @param messageHandlers receive every inbound envelope other than REQUEST (and STREAM_REQUEST,
+     *                        when a {@link NodeStreamRequestHandler} serves it).
      */
     public WebSocketOutboundNodeConnection(NodeConnectionProperties properties,
                                            NodeRequestHandler<?, ?> requestHandler,
@@ -129,10 +143,32 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
                                            NodeRequestHandler<?, ?> requestHandler,
                                            List<NodeMessageHandler> messageHandlers,
                                            Supplier<NodeHealthResponse> healthSource) {
+        this(properties, requestHandler, null, messageHandlers, healthSource, null);
+    }
+
+    /**
+     * @param streamRequestHandler serves STREAM_REQUESTs received over this connection; {@code null}
+     *                             leaves STREAM_REQUEST and CANCEL to {@code messageHandlers}.
+     * @param activeRequestCounter counts the Worker inference requests ({@code WorkerRequest}) being
+     *                             served by the two handlers; {@code null} disables counting.
+     */
+    public WebSocketOutboundNodeConnection(NodeConnectionProperties properties,
+                                           NodeRequestHandler<?, ?> requestHandler,
+                                           NodeStreamRequestHandler<?, ?> streamRequestHandler,
+                                           List<NodeMessageHandler> messageHandlers,
+                                           Supplier<NodeHealthResponse> healthSource,
+                                           ActiveRequestCounter activeRequestCounter) {
         this.properties = properties;
         this.requestHandler = requestHandler;
         this.messageHandlers = List.copyOf(messageHandlers);
         this.healthSource = healthSource;
+        this.requestCounter = requestHandler == null
+                ? new ActiveRequestCounter()
+                : inferenceCounter(activeRequestCounter, requestHandler.requestType());
+        this.streams = streamRequestHandler == null
+                ? null
+                : OutboundStreamRegistry.create(this, streamRequestHandler, messageExecutor,
+                        inferenceCounter(activeRequestCounter, streamRequestHandler.requestType()));
         this.backoff = new ReconnectBackoff(
                 properties.getOutbound().getReconnect().getInitialDelay(),
                 properties.getOutbound().getReconnect().getMaxDelay());
@@ -155,6 +191,7 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
         stopHeartbeat();
         stopHealthReporting();
         state.set(NodeConnectionState.DISCONNECTED);
+        cancelStreams("outbound connection closed");
 
         WebSocket ws = this.webSocket;
         this.webSocket = null;
@@ -296,6 +333,8 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
         stopHeartbeat();
         stopHealthReporting();
         webSocket = null;
+        // Their chunks have nowhere to go: Console already failed these streams with the connection.
+        cancelStreams("outbound connection lost");
         log.info("Disconnected from InfraMesh Console");
         scheduleReconnect();
     }
@@ -422,8 +461,22 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
         send(newEnvelope(NodeMessageType.HEALTH, null, health));
     }
 
-    private <T> NodeEnvelope<T> newEnvelope(NodeMessageType type, String requestId, T payload) {
+    <T> NodeEnvelope<T> newEnvelope(NodeMessageType type, String requestId, T payload) {
         return NodeEnvelope.create(type, properties.getNodeId(), requestId, payload);
+    }
+
+    // Only Worker inference is an active request: REQUEST and STREAM_REQUEST carry a WorkerRequest
+    // for a Worker, while a Router's handler (RoutingRequest) must leave the count untouched.
+    private static ActiveRequestCounter inferenceCounter(ActiveRequestCounter counter, Class<?> requestType) {
+        return counter != null && WorkerRequest.class.isAssignableFrom(requestType)
+                ? counter
+                : new ActiveRequestCounter();
+    }
+
+    private void cancelStreams(String reason) {
+        if (streams != null) {
+            streams.cancelAll(reason);
+        }
     }
 
     private static ThreadFactory daemonThreads(String namePrefix) {
@@ -511,7 +564,12 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
 
         if (envelope.type() == NodeMessageType.REQUEST) {
             handleRequest(webSocket, envelope);
+        } else if (streams != null && envelope.type() == NodeMessageType.STREAM_REQUEST) {
+            streams.start(webSocket, envelope);
         } else {
+            if (streams != null && envelope.type() == NodeMessageType.CANCEL) {
+                messageExecutor.execute(() -> streams.cancel(envelope.requestId(), "CANCEL received"));
+            }
             dispatchToMessageHandlers(envelope);
         }
     }
@@ -541,12 +599,16 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
                     new NodeError(NodeError.MALFORMED_PAYLOAD, "Malformed request payload"));
         }
 
+        // Active only while the handler runs - sending the RESPONSE/ERROR afterwards is not inference.
+        requestCounter.increment();
         try {
             return newEnvelope(NodeMessageType.RESPONSE, requestId, handler.handle(request));
         } catch (RuntimeException e) {
             log.warn("Outbound request failed, requestId={}", requestId, e);
             return newEnvelope(NodeMessageType.ERROR, requestId,
                     new NodeError(NodeError.REQUEST_FAILED, String.valueOf(e.getMessage())));
+        } finally {
+            requestCounter.decrement();
         }
     }
 
@@ -566,7 +628,7 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
     // the stale RESPONSE/ERROR is dropped rather than sent over the new connection - Console has
     // already failed that request with the old connection, and it must not be mistaken for a
     // response on the new one.
-    private void sendIfSameConnection(WebSocket originatingWebSocket, NodeEnvelope<?> envelope) {
+    void sendIfSameConnection(WebSocket originatingWebSocket, NodeEnvelope<?> envelope) {
         if (this.webSocket == originatingWebSocket) {
             send(envelope);
         } else {

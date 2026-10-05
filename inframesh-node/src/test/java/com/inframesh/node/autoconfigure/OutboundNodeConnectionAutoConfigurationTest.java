@@ -2,12 +2,16 @@ package com.inframesh.node.autoconfigure;
 
 import com.inframesh.node.connection.NodeConnectionProperties;
 import com.inframesh.node.connection.NodeRequestHandler;
+import com.inframesh.node.connection.NodeStreamRequestHandler;
 import com.inframesh.node.connection.OutboundNodeConnection;
 import com.inframesh.node.connection.WebSocketOutboundNodeConnection;
+import com.inframesh.node.dto.worker.WorkerRequest;
+import com.inframesh.node.monitor.ActiveRequestCounter;
 import com.inframesh.node.service.NodeHealthService;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import reactor.core.publisher.Flux;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -100,6 +104,21 @@ class OutboundNodeConnectionAutoConfigurationTest {
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(context).hasSingleBean(NodeHealthService.class);
+                    assertThat(context.getBean(WebSocketOutboundNodeConnection.class).isRunning()).isTrue();
+                });
+    }
+
+    @Test
+    void outboundMode_withStreamRequestHandlerBean_startsConnection() {
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(
+                        NodeAutoConfiguration.class, OutboundNodeConnectionAutoConfiguration.class))
+                .withPropertyValues(OUTBOUND_PROPERTIES)
+                .withBean(NodeStreamRequestHandler.class,
+                        () -> NodeStreamRequestHandler.of(WorkerRequest.class, request -> Flux.<String>empty()))
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).hasSingleBean(ActiveRequestCounter.class);
                     assertThat(context.getBean(WebSocketOutboundNodeConnection.class).isRunning()).isTrue();
                 });
     }

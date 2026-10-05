@@ -5,15 +5,16 @@ import tools.jackson.databind.JsonNode;
 
 /**
  * Generic receiver for inbound envelopes other than REQUEST (which is served by
- * {@link NodeRequestHandler}): acknowledgements, and also STREAM_REQUEST and
- * CANCEL.
+ * {@link NodeRequestHandler}): acknowledgements, CANCEL, and - unless a
+ * {@link NodeStreamRequestHandler} serves it - STREAM_REQUEST.
  *
- * A Worker serves streaming here: on STREAM_REQUEST it deserializes the payload
- * (a {@code WorkerRequest}), runs its streaming inference, and sends
- * STREAM_CHUNK... then STREAM_COMPLETE or STREAM_ERROR through
- * {@link OutboundNodeConnection#send}, each with the STREAM_REQUEST's
- * {@code requestId}; on CANCEL it stops the inference with that requestId. The
- * SDK itself holds no streaming state.
+ * Without a {@link NodeStreamRequestHandler} a node may serve streaming here
+ * itself: on STREAM_REQUEST it deserializes the payload (a {@code WorkerRequest}),
+ * runs its streaming inference, and sends STREAM_CHUNK... then STREAM_COMPLETE
+ * or STREAM_ERROR through {@link OutboundNodeConnection#send}, each with the
+ * STREAM_REQUEST's {@code requestId}; on CANCEL it stops the inference with
+ * that requestId. The SDK holds no state for such a stream and does not count
+ * it as an active request - prefer {@link NodeStreamRequestHandler}.
  *
  * Every registered handler receives every such envelope, with the payload left
  * as raw JSON - the connection SDK does not interpret message semantics.
