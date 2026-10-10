@@ -460,7 +460,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.github.inframeshai:inframesh-node:0.1.2'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.3'
 }
 ```
 
@@ -470,7 +470,7 @@ dependencies {
 <dependency>
     <groupId>io.github.inframeshai</groupId>
     <artifactId>inframesh-node</artifactId>
-    <version>0.1.2</version>
+    <version>0.1.3</version>
 </dependency>
 ```
 
@@ -497,7 +497,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.github.inframeshai:inframesh-node:0.1.2'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.3'
 }
 ```
 
