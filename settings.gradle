@@ -1,11 +1,9 @@
 pluginManagement {
     def springBootVersion = providers.gradleProperty("springBootVersion").get()
-    def dependencyManagementVersion = providers.gradleProperty("dependencyManagementVersion").get()
     def mavenPublishPluginVersion = providers.gradleProperty("mavenPublishPluginVersion").get()
 
     plugins {
         id 'org.springframework.boot' version springBootVersion
-        id 'io.spring.dependency-management' version dependencyManagementVersion
         id 'com.vanniktech.maven.publish' version mavenPublishPluginVersion
     }
 }

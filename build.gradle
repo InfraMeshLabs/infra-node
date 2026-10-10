@@ -4,7 +4,7 @@ plugins {
 
 allprojects {
     group = 'io.github.inframeshai'
-    version = '0.1.2'
+    version = '0.1.3'
 
     repositories {
         mavenCentral()
@@ -34,11 +34,23 @@ subprojects {
         }
     }
 
-    plugins.withId('io.spring.dependency-management') {
-        dependencyManagement {
-            imports {
-                mavenBom "org.springframework.boot:spring-boot-dependencies:${springBootVersion}"
+    // Spring Boot's BOM is a build-time concern only: it picks the versions this SDK is
+    // compiled and tested against, but lives in a configuration that is never published,
+    // so consumers do not inherit the BOM (see versionMapping in inframesh-node/build.gradle).
+    plugins.withId('java') {
+        configurations {
+            internalPlatform {
+                canBeConsumed = false
+                canBeResolved = false
             }
+            [compileClasspath, runtimeClasspath, annotationProcessor,
+             testCompileClasspath, testRuntimeClasspath, testAnnotationProcessor].each {
+                it.extendsFrom(internalPlatform)
+            }
+        }
+
+        dependencies {
+            internalPlatform platform("org.springframework.boot:spring-boot-dependencies:${springBootVersion}")
         }
     }
 }

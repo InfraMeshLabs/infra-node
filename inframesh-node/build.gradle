@@ -1,6 +1,5 @@
 plugins {
     id 'java-library'
-    id 'io.spring.dependency-management'
     id 'com.vanniktech.maven.publish'
 }
 
@@ -22,6 +21,18 @@ dependencies {
 // META-INF/additional-spring-configuration-metadata.json into the generated metadata.
 tasks.named('compileJava') {
     inputs.files(tasks.named('processResources'))
+}
+
+// The BOM itself is not published; instead the versions it resolved to are written into
+// the POM and Gradle Module Metadata as ordinary (overridable) dependency versions.
+publishing {
+    publications.withType(MavenPublication).configureEach {
+        versionMapping {
+            allVariants {
+                fromResolutionResult()
+            }
+        }
+    }
 }
 
 mavenPublishing {
