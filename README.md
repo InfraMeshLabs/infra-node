@@ -150,6 +150,36 @@ Session creation and Worker affinity are managed by Console.
 
 `infra-node` only defines and transports the session identifier.
 
+## Identity Context
+
+Console authenticates every inference request with a Team Member API Key and forwards the
+resulting identity to the Router and the Worker. Console does not store or search long-term
+memory; these identifiers let a Router or Worker do so in its own store.
+
+| Field | Where | Meaning |
+|---|---|---|
+| `teamUuid` | `RoutingRequest`, `WorkerRequest` | Team the API key belongs to |
+| `memberUuid` | `RoutingRequest`, `WorkerRequest` | Team Member that owns the API key (per Team — the same account has a different value in each Team) |
+| `nodeId` | `WorkerCandidate` | The Worker's immutable node UUID — the same value as `NodeRegistrationResponse.nodeId` / `NodeEnvelope.nodeId` |
+| `sessionId` | `RoutingRequest`, `WorkerRequest` | Current conversation; chosen by the client |
+
+- Values come only from Console's authentication result, never from client input. All are
+  nullable (an older Console sends none of them).
+- **They are identifiers, not credentials.** A memory service must authenticate the Router /
+  Worker itself; knowing a UUID must not grant access.
+- Scope long-term state by `teamUuid` / `memberUuid`. **Never by `sessionId` alone** — it is
+  client-chosen and changes every session.
+- `WorkerCandidate.workerId` (Long) is a Console-local database id and is what
+  `RoutingResponse` returns. Persist `nodeId` instead in an external store and match it
+  against later candidates. Re-registering a Worker issues a new `nodeId`; memory that must
+  survive a Worker replacement belongs to your own agent / task ids.
+- With Session Affinity on, an affinity hit sends the request straight to the bound Worker
+  without calling the Router. A Team that wants memory-aware routing on every request
+  disables Session Affinity for that Team.
+- Compatibility: nodes that do not know these fields ignore them (Jackson's default
+  `FAIL_ON_UNKNOWN_PROPERTIES=false`). The previous record constructor signatures remain
+  available.
+
 ## Node Registration & Connection Protocol
 
 Console reaches a node in one of two connection modes. Both coexist; `DIRECT` remains the default.
