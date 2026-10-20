@@ -6,6 +6,7 @@ import com.inframesh.node.dto.ToolChoice;
 import com.inframesh.node.dto.ToolDefinition;
 
 import java.util.List;
+import java.util.UUID;
 
 public record RoutingRequest(
         /**
@@ -21,12 +22,28 @@ public record RoutingRequest(
         RoutingHints routing,
         List<ToolDefinition> tools,
         ToolChoice toolChoice,
-        List<WorkerCandidate> workers
+        List<WorkerCandidate> workers,
+
+        /**
+         * Console-authenticated identity of the caller, resolved from the
+         * Member API Key — never taken from client input. Stable across
+         * sessions, so a Router may use it to look up long-term state in its
+         * own store; {@code sessionId} must not be used for that on its own.
+         * Identifiers only, not credentials. Null when unknown (an older
+         * Console, or a caller with no Team Member).
+         */
+        UUID teamUuid,
+        UUID memberUuid
 ) {
 
     public RoutingRequest {
         tools = tools == null ? List.of() : List.copyOf(tools);
         workers = workers == null ? List.of() : List.copyOf(workers);
+    }
+
+    public RoutingRequest(String sessionId, List<ChatMessage> messages, ChatOptions options, RoutingHints routing,
+                          List<ToolDefinition> tools, ToolChoice toolChoice, List<WorkerCandidate> workers) {
+        this(sessionId, messages, options, routing, tools, toolChoice, workers, null, null);
     }
 
     public RoutingRequest(List<ChatMessage> messages, ChatOptions options, RoutingHints routing) {

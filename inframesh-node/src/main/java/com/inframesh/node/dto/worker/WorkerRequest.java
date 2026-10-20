@@ -6,6 +6,7 @@ import com.inframesh.node.dto.ToolChoice;
 import com.inframesh.node.dto.ToolDefinition;
 
 import java.util.List;
+import java.util.UUID;
 
 public record WorkerRequest(
         /**
@@ -25,11 +26,26 @@ public record WorkerRequest(
          * enforce the same restriction itself (defense in depth). Missing,
          * null, and false are all equivalent — see {@link #isPrivateData()}.
          */
-        Boolean privateData
+        Boolean privateData,
+
+        /**
+         * Console-authenticated identity of the caller, resolved from the
+         * Member API Key — never taken from client input. Stable across
+         * sessions, so a Worker may scope long-term state by it; never scope
+         * by {@code sessionId} alone. Identifiers only, not credentials.
+         * Null when unknown (an older Console, or a caller with no Team Member).
+         */
+        UUID teamUuid,
+        UUID memberUuid
 ) {
 
     public WorkerRequest {
         tools = tools == null ? List.of() : List.copyOf(tools);
+    }
+
+    public WorkerRequest(String sessionId, List<ChatMessage> messages, ChatOptions options, List<ToolDefinition> tools,
+                         ToolChoice toolChoice, Boolean privateData) {
+        this(sessionId, messages, options, tools, toolChoice, privateData, null, null);
     }
 
     public WorkerRequest(List<ChatMessage> messages, ChatOptions options) {
