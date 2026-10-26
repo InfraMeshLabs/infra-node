@@ -166,7 +166,7 @@ final class OutboundStreamRegistry<Q, T> {
                 return;
             }
             log.warn("Outbound stream failed, requestId={}", requestId, error);
-            send(NodeMessageType.STREAM_ERROR, new NodeError(NodeError.REQUEST_FAILED, String.valueOf(error.getMessage())));
+            send(NodeMessageType.STREAM_ERROR, NodeErrorCarrier.toNodeError(error));
         }
 
         @Override

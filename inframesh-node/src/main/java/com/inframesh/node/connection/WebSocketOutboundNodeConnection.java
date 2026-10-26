@@ -605,8 +605,7 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
             return newEnvelope(NodeMessageType.RESPONSE, requestId, handler.handle(request));
         } catch (RuntimeException e) {
             log.warn("Outbound request failed, requestId={}", requestId, e);
-            return newEnvelope(NodeMessageType.ERROR, requestId,
-                    new NodeError(NodeError.REQUEST_FAILED, String.valueOf(e.getMessage())));
+            return newEnvelope(NodeMessageType.ERROR, requestId, NodeErrorCarrier.toNodeError(e));
         } finally {
             requestCounter.decrement();
         }

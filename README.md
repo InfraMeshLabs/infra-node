@@ -233,7 +233,8 @@ nodeId + credential ──▶ Connection handshake ──▶ NodeEnvelope<NodeHe
 - A node sends `NodeEnvelope<NodeHeartbeat>` periodically over its connection to signal it is
   still alive.
 - A `REQUEST` is answered by exactly one `RESPONSE` (success) or `ERROR` (payload `NodeError`,
-  `{"code": ..., "message": ...}`) carrying the same `requestId`.
+  `{"code": ..., "message": ...}`) carrying the same `requestId`. A handler failure has code
+  `REQUEST_FAILED` unless the handler sets its own (see [Error codes](#error-codes)).
 
 ### Streaming
 
@@ -363,12 +364,48 @@ The handler may block (for example `.block()` on a reactive service) without del
 or other in-flight requests. A node that defines no `NodeRequestHandler` still connects and
 heartbeats; it rejects `REQUEST`s with an `ERROR` so Console does not wait for a timeout.
 
+### Error codes
+
+By default a handler that throws is answered with `NodeError("REQUEST_FAILED", <exception
+message>)`. To send a machine-readable code Console can act on instead - a Router refusing a
+request for a policy reason, say - throw an exception implementing `NodeErrorCarrier`; the SDK
+sends its `nodeError()` as the `ERROR` (or `STREAM_ERROR`) payload. `NodeRequestException` is a
+ready-made one:
+
+```java
+throw new NodeRequestException("PRIVATE_DATA_NO_LOCAL_WORKER",
+        "privateData routing hint is set but no worker candidate is LOCAL-only.");
+```
+
+`NodeErrorCarrier` is an interface so an exception that already extends something else can
+carry a code too - for example a Spring `ResponseStatusException` a node also uses for its DIRECT
+HTTP error response:
+
+```java
+public class PrivateDataRejectedException extends ResponseStatusException implements NodeErrorCarrier {
+
+    public PrivateDataRejectedException(String reason) {
+        super(HttpStatus.UNPROCESSABLE_ENTITY, reason);
+    }
+
+    @Override
+    public NodeError nodeError() {
+        return new NodeError("PRIVATE_DATA_NO_LOCAL_WORKER", getReason());
+    }
+}
+```
+
+A `null` `nodeError()` or a blank code falls back to `REQUEST_FAILED`. The message is sent to
+Console as is, so it must be short and client-safe - never a stack trace, credential, request
+content or other internal detail. Available since `0.1.5`.
+
 ### Serving streams
 
 Register a `NodeStreamRequestHandler` bean to serve `STREAM_REQUEST`. It returns a
 `org.reactivestreams.Publisher` (a Reactor `Flux` is one); the SDK owns the rest of the stream
 lifecycle: it subscribes, sends every element as a `STREAM_CHUNK` with an increasing `sequence`,
-and ends with `STREAM_COMPLETE`, or `STREAM_ERROR` if the publisher fails or the handler throws.
+and ends with `STREAM_COMPLETE`, or `STREAM_ERROR` if the publisher fails or the handler throws
+(code `REQUEST_FAILED`, or the failure's own code - see [Error codes](#error-codes)).
 A `CANCEL` for the stream's `requestId`, or losing the connection, cancels the subscription and
 sends nothing further.
 
@@ -541,7 +578,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.github.inframeshai:inframesh-node:0.1.3'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.5'
 }
 ```
 
@@ -551,7 +588,7 @@ dependencies {
 <dependency>
     <groupId>io.github.inframeshai</groupId>
     <artifactId>inframesh-node</artifactId>
-    <version>0.1.3</version>
+    <version>0.1.5</version>
 </dependency>
 ```
 
@@ -578,7 +615,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.github.inframeshai:inframesh-node:0.1.3'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.5'
 }
 ```
 
