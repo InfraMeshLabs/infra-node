@@ -4,6 +4,7 @@ import com.inframesh.node.dto.ChatMessage;
 import com.inframesh.node.dto.ChatOptions;
 import com.inframesh.node.dto.ToolChoice;
 import com.inframesh.node.dto.ToolDefinition;
+import com.inframesh.node.enums.DataRoutingPolicy;
 
 import java.util.List;
 import java.util.UUID;
@@ -33,12 +34,27 @@ public record RoutingRequest(
          * Console, or a caller with no Team Member).
          */
         UUID teamUuid,
-        UUID memberUuid
+        UUID memberUuid,
+
+        /**
+         * The Team's data routing policy, from Console's Team settings - never
+         * from client input. Missing/null (an older Console) is read as
+         * {@link DataRoutingPolicy#AUTO}. {@code routing.privateData=true}
+         * still restricts to LOCAL-only Workers under every policy.
+         */
+        DataRoutingPolicy dataRoutingPolicy
 ) {
 
     public RoutingRequest {
         tools = tools == null ? List.of() : List.copyOf(tools);
         workers = workers == null ? List.of() : List.copyOf(workers);
+        dataRoutingPolicy = dataRoutingPolicy == null ? DataRoutingPolicy.AUTO : dataRoutingPolicy;
+    }
+
+    public RoutingRequest(String sessionId, List<ChatMessage> messages, ChatOptions options, RoutingHints routing,
+                          List<ToolDefinition> tools, ToolChoice toolChoice, List<WorkerCandidate> workers,
+                          UUID teamUuid, UUID memberUuid) {
+        this(sessionId, messages, options, routing, tools, toolChoice, workers, teamUuid, memberUuid, null);
     }
 
     public RoutingRequest(String sessionId, List<ChatMessage> messages, ChatOptions options, RoutingHints routing,

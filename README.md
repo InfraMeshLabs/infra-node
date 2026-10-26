@@ -150,6 +150,22 @@ Session creation and Worker affinity are managed by Console.
 
 `infra-node` only defines and transports the session identifier.
 
+## Data Routing Policy
+
+`RoutingRequest.dataRoutingPolicy` (`DataRoutingPolicy`, available since `0.1.6`) is the Team's rule
+for which Workers an `AI_ROUTER` Router may pick. Console fills it from Team settings, never from
+client input.
+
+| Value | Router behavior |
+|---|---|
+| `AUTO` | Judge whether the request holds sensitive data; a sensitive or unjudged request must go to a LOCAL-only Worker |
+| `INTERNAL_ONLY` | No sensitivity judgement; LOCAL-only Workers only (Console already sends only those as candidates) |
+| `EXTERNAL_ALLOWED` | No sensitivity judgement; any candidate (not a preference for EXTERNAL Workers) |
+
+- `routing.privateData=true` always wins: LOCAL-only Workers under every policy.
+- Missing/null (an older Console) is read as `AUTO` by the record's compact constructor. The
+  previous constructor signatures remain available.
+
 ## Identity Context
 
 Console authenticates every inference request with a Team Member API Key and forwards the
@@ -578,7 +594,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.github.inframeshai:inframesh-node:0.1.5'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.6'
 }
 ```
 
@@ -588,7 +604,7 @@ dependencies {
 <dependency>
     <groupId>io.github.inframeshai</groupId>
     <artifactId>inframesh-node</artifactId>
-    <version>0.1.5</version>
+    <version>0.1.6</version>
 </dependency>
 ```
 
@@ -615,7 +631,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.github.inframeshai:inframesh-node:0.1.5'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.6'
 }
 ```
 

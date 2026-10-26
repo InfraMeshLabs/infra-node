@@ -5,6 +5,7 @@ import com.inframesh.node.dto.router.RoutingHints;
 import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.WorkerCandidate;
 import com.inframesh.node.dto.worker.WorkerRequest;
+import com.inframesh.node.enums.DataRoutingPolicy;
 import com.inframesh.node.enums.ExecutionLocation;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.json.JsonMapper;
@@ -182,5 +183,26 @@ class PrivateRoutingAndCapabilityTest {
 
         assertThat(request.privateData()).isNull();
         assertThat(request.isPrivateData()).isFalse();
+    }
+
+    @Test
+    void dataRoutingPolicyRoundTrips() {
+        RoutingRequest request = new RoutingRequest("s-1", List.of(ChatMessage.user("hi")), null, null, List.of(), null,
+                List.of(), null, null, DataRoutingPolicy.EXTERNAL_ALLOWED);
+
+        RoutingRequest read = mapper.readValue(mapper.writeValueAsString(request), RoutingRequest.class);
+
+        assertThat(read.dataRoutingPolicy()).isEqualTo(DataRoutingPolicy.EXTERNAL_ALLOWED);
+    }
+
+    // An older Console sends no policy - read as AUTO, the pre-policy behavior.
+    @Test
+    void missingDataRoutingPolicyIsAuto() {
+        RoutingRequest read = mapper.readValue("""
+                {"messages": [{"role": "USER", "content": "hi"}]}
+                """, RoutingRequest.class);
+
+        assertThat(read.dataRoutingPolicy()).isEqualTo(DataRoutingPolicy.AUTO);
+        assertThat(new RoutingRequest(List.of(), null, null).dataRoutingPolicy()).isEqualTo(DataRoutingPolicy.AUTO);
     }
 }
