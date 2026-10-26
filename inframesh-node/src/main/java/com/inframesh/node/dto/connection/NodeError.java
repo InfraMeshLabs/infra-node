@@ -24,6 +24,9 @@ public record NodeError(
     /** The node has no handler for this kind of request. */
     public static final String UNSUPPORTED_REQUEST = "UNSUPPORTED_REQUEST";
 
-    /** The node's handler failed while serving the request. */
+    /**
+     * The node's handler failed while serving the request. A handler that throws a
+     * {@link com.inframesh.node.connection.NodeErrorCarrier} sends its own code instead.
+     */
     public static final String REQUEST_FAILED = "REQUEST_FAILED";
 }

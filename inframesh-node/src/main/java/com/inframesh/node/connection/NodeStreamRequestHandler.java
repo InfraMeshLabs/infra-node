@@ -15,7 +15,8 @@ import java.util.function.Function;
  * {@link Publisher} returned by {@link #handle(Object)}, sends every element
  * as a STREAM_CHUNK (sequence starting at {@code 0}) and ends the stream with
  * STREAM_COMPLETE, or STREAM_ERROR if the publisher fails or
- * {@link #handle(Object)} throws. A CANCEL for the stream's {@code requestId},
+영 * {@link #handle(Object)} throws - code {@code REQUEST_FAILED}, or the failure's own
+ * {@link NodeErrorCarrier#nodeError()} when it implements {@link NodeErrorCarrier}. A CANCEL for the stream's {@code requestId},
  * or the loss of the connection, cancels the subscription and sends nothing
  * further.
  *

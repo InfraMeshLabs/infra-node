@@ -380,6 +380,26 @@ class WebSocketOutboundNodeConnectionTest {
     }
 
     @Test
+    void request_whenHandlerThrowsANodeErrorCarrier_respondsWithItsOwnCode() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId)
+                .requestHandler(NodeRequestHandler.of(EchoRequest.class, request -> {
+                    throw new NodeRequestException("PRIVATE_DATA_NO_LOCAL_WORKER", "no LOCAL-only worker");
+                })));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        server.sendTextFrame(requestFrame(nodeId, "req-1", "world"));
+
+        JsonNode error = JsonMapper.shared().readTree(awaitFrameContaining("\"type\":\"ERROR\""));
+        assertThat(error.get("requestId").asString()).isEqualTo("req-1");
+        assertThat(error.get("payload").get("code").asString()).isEqualTo("PRIVATE_DATA_NO_LOCAL_WORKER");
+        assertThat(error.get("payload").get("message").asString()).isEqualTo("no LOCAL-only worker");
+    }
+
+    @Test
     void request_withMalformedPayload_respondsWithError() throws Exception {
         UUID nodeId = UUID.randomUUID();
         server = new FakeConsoleServer();
@@ -789,6 +809,27 @@ class WebSocketOutboundNodeConnectionTest {
         assertThat(complete.get("requestId").asString()).isEqualTo("req-s");
         assertThat(complete.get("payload").get("chunkCount").asLong()).isEqualTo(3);
         assertThat(counter.get()).isZero();
+    }
+
+    @Test
+    void streamFailure_withANodeErrorCarrier_sendsItsOwnCode() throws Exception {
+        UUID nodeId = UUID.randomUUID();
+        server = new FakeConsoleServer();
+        Sinks.Many<EchoResponse> sink = Sinks.many().unicast().onBackpressureBuffer();
+        connection = newConnection(options(server.baseUrl()).nodeId(nodeId)
+                .streamRequestHandler(NodeStreamRequestHandler.of(WorkerRequest.class, request -> sink.asFlux())));
+
+        connection.connect();
+        awaitState(NodeConnectionState.CONNECTED);
+
+        server.sendTextFrame(workerFrame(NodeMessageType.STREAM_REQUEST, nodeId, "req-s", "a"));
+        awaitValue(sink::currentSubscriberCount, 1);
+
+        sink.tryEmitError(new NodeRequestException("RUNTIME_UNAVAILABLE", "Model runtime is not reachable"));
+
+        JsonNode error = JsonMapper.shared().readTree(awaitFrameContaining("\"type\":\"STREAM_ERROR\""));
+        assertThat(error.get("payload").get("code").asString()).isEqualTo("RUNTIME_UNAVAILABLE");
+        assertThat(error.get("payload").get("message").asString()).isEqualTo("Model runtime is not reachable");
     }
 
     @Test

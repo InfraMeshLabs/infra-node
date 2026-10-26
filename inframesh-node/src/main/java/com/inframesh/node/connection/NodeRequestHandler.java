@@ -19,7 +19,9 @@ import java.util.function.Function;
  * {@code .block()} on an existing reactive service) without stalling
  * heartbeats or other in-flight requests. Throwing from {@link #handle(Object)}
  * is reported back to Console as an ERROR envelope carrying the exception
- * message, rather than leaving Console waiting for the request timeout.
+ * message, rather than leaving Console waiting for the request timeout - with
+ * code {@code REQUEST_FAILED}, or the exception's own {@link NodeErrorCarrier#nodeError()}
+ * when it implements {@link NodeErrorCarrier} (e.g. {@link NodeRequestException}).
  *
  * @param <Q> REQUEST payload type
  * @param <R> RESPONSE payload type
