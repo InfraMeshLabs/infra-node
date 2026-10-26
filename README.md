@@ -438,6 +438,57 @@ To send an envelope yourself, inject `OutboundNodeConnection` (`connect`, `disco
 | Connection identity | A late `RESPONSE` for a `REQUEST` received on a connection that has since been replaced is dropped rather than sent over the new connection. Late events from a replaced connection do not affect the current one. |
 | Shutdown | Forbid reconnects → cancel a pending reconnect → stop heartbeat → close the socket. A handshake that completes after shutdown began is closed immediately instead of reviving the connection. |
 
+### Credential lifecycle
+
+The credential is issued by InfraMesh Console. The registration response returns the first one;
+more can be issued from the Console (**Nodes → node → Credential → Manage credentials**). The raw
+credential is shown only once, at issue time — Console stores only its hash.
+
+Set it through the environment rather than a file in version control:
+
+```bash
+INFRAMESH_NODE_ID=<nodeId>                 # never changes
+INFRAMESH_NODE_CREDENTIAL=<credential>
+```
+
+The SDK reads `nodeId` and `credential` once, at startup. Changing the credential therefore needs a
+node restart; reconnects always reuse the credential the process started with.
+
+**Rotation** — a node may have several valid credentials at once, so a credential can be replaced
+without a window in which the node cannot authenticate:
+
+1. Issue a new credential in the Console. The current credential and connection stay valid.
+2. Disable the node in the Console. This only stops new requests from being routed to it
+   (including sticky Session Affinity sessions); requests already running keep running.
+3. Wait for running requests to finish: the node's **Active requests** in the Console node detail
+   (reselect the node to refresh) should reach `0`. If it stays above `0`, wait for your longest
+   request timeout. Router nodes have no such counter — wait for the router request timeout.
+4. Set `INFRAMESH_NODE_CREDENTIAL` to the new credential.
+5. Restart the node.
+6. In the Console credential list, check that the new credential is marked **Connected**.
+7. Enable the node again.
+8. Revoke the previous credential. Nothing is disconnected, because no connection uses it anymore.
+
+Steps 2, 3 and 7 avoid failing requests during the restart; skip them if a few failed requests are
+acceptable. Disabling a node does not cancel or complete running requests — any request still
+running when the node restarts fails on the Console side.
+
+If the node cannot connect with the new credential (for example a copy error), the previous
+credential is still valid — restore the previous configuration and restart.
+
+Do not run the old and the new process at the same time: the Console keeps one connection per
+node, so the two processes keep replacing each other's connection. Stop the old process first
+(revoking the old credential also stops it from reconnecting).
+
+**Revocation and expiry** — when a credential is revoked, Console closes the connection
+authenticated with it (close code `4002`). A credential can also be issued with an expiry date;
+when it expires, Console closes the connection (close code `4003`, checked every 10 seconds).
+Credentials issued at registration never expire. In both cases the SDK keeps reconnecting with
+backoff (up to `outbound.reconnect.max-delay`), and every attempt is rejected at the handshake with
+HTTP `401` until the node is restarted with a valid credential. The SDK logs the close
+(`WebSocket closed by InfraMesh Console, statusCode=4002, reason=credential revoked`) and each
+rejected attempt as `Failed to connect to InfraMesh Console`; the credential itself is never logged.
+
 ## Node Health
 
 Router and Worker nodes can expose runtime health information through:
