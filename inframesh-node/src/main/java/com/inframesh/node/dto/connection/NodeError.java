@@ -29,4 +29,10 @@ public record NodeError(
      * {@link com.inframesh.node.connection.NodeErrorCarrier} sends its own code instead.
      */
     public static final String REQUEST_FAILED = "REQUEST_FAILED";
+
+    /**
+     * Ends a non-streaming REQUEST that Console cancelled (CANCEL): sent once the node's handler call
+     * has actually returned - or never started -, never alongside a RESPONSE for the same request.
+     */
+    public static final String CANCELLED = "CANCELLED";
 }

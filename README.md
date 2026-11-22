@@ -283,6 +283,18 @@ STREAM_COMPLETE  messageId=M4  requestId=R1  payload={"chunkCount":2}
 - Exactly one of `STREAM_COMPLETE` / `STREAM_ERROR` ends a stream. After sending `CANCEL`,
   Console treats the request as finished and ignores any later message with its `requestId`; the
   Worker need not acknowledge. A `CANCEL` for an unknown or finished request is a no-op.
+- A `CANCEL` for a non-streaming `REQUEST` that has not started yet keeps its handler from running;
+  for a running one it interrupts the handler's thread. The request ends - and sends its single
+  `ERROR` with `NodeError.code = "CANCELLED"` (`NodeError.CANCELLED`) - only once the handler call has actually returned
+  (or never started), never a `RESPONSE`, even if the handler returns a result. A handler that
+  ignores the interrupt keeps running, stays counted in `activeRequests`, and the `ERROR` waits
+  until it returns; the SDK never stops a thread forcibly. Whether the work behind the handler
+  (an LLM runtime call) actually stops depends on the handler reacting to the interrupt - Reactor's
+  `.block()` does (it cancels its subscription); the SDK guarantees only that the handler call ended.
+  Losing the connection cancels the `REQUEST`s that arrived on it the same way; their final
+  messages are dropped rather than sent over a new connection. A cancelled handler that ends by
+  throwing an `Error` still ends with `ERROR(CANCELLED)` (the `Error` keeps propagating); an
+  uncancelled one sends nothing for an `Error`, as before.
 - `ERROR` keeps its meaning: protocol/connection errors and failures of non-streaming `REQUEST`s.
   `STREAM_ERROR` is always scoped to a stream.
 - `NodeError.message` is a short client-safe description - never a stack trace, credential or
@@ -448,7 +460,8 @@ WebSocket messages or HTTP connections). For OUTBOUND the SDK maintains it throu
 | `REQUEST` | the `NodeRequestHandler` starts | it returns or throws (sending the `RESPONSE`/`ERROR` is not included) |
 | `STREAM_REQUEST` | the stream is accepted | the stream ends - complete, error or cancelled, exactly once |
 
-A `CANCEL` does not decrement by itself; it cancels the stream, and the stream ending does. Only
+A `CANCEL` does not decrement by itself; it cancels the stream (or interrupts the `REQUEST` handler),
+and the stream ending (or the handler returning) does. Only
 handlers whose request type is `WorkerRequest` are counted, so a Router's
 `NodeRequestHandler<RoutingRequest, RoutingResponse>` never shows up as an active request. Do not
 increment `ActiveRequestCounter` again inside an OUTBOUND handler - that would count the request

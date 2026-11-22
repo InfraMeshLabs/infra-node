@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
@@ -105,6 +106,8 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
     // null unless a NodeStreamRequestHandler is configured; STREAM_REQUEST/CANCEL then go to
     // NodeMessageHandlers only.
     private final OutboundStreamRegistry<?, ?> streams;
+    // null unless a NodeRequestHandler is configured (REQUESTs are then rejected with an ERROR).
+    private final OutboundRequestRegistry requests;
 
     private final AtomicReference<NodeConnectionState> state =
             new AtomicReference<>(NodeConnectionState.DISCONNECTED);
@@ -165,6 +168,9 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
         this.requestCounter = requestHandler == null
                 ? new ActiveRequestCounter()
                 : inferenceCounter(activeRequestCounter, requestHandler.requestType());
+        this.requests = requestHandler == null
+                ? null
+                : new OutboundRequestRegistry(this, requestHandler, messageExecutor, requestCounter);
         this.streams = streamRequestHandler == null
                 ? null
                 : OutboundStreamRegistry.create(this, streamRequestHandler, messageExecutor,
@@ -192,6 +198,7 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
         stopHealthReporting();
         state.set(NodeConnectionState.DISCONNECTED);
         cancelStreams("outbound connection closed");
+        cancelRequests(null, "outbound connection closed");
 
         WebSocket ws = this.webSocket;
         this.webSocket = null;
@@ -335,6 +342,12 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
         webSocket = null;
         // Their chunks have nowhere to go: Console already failed these streams with the connection.
         cancelStreams("outbound connection lost");
+        // Same for REQUESTs that arrived on the lost connection; a handler already running stays tracked
+        // until it returns, and its final message is dropped (sendIfSameConnection).
+        WebSocket lost = source != null ? source : current;
+        if (lost != null) {
+            cancelRequests(lost, "outbound connection lost");
+        }
         log.info("Disconnected from InfraMesh Console");
         scheduleReconnect();
     }
@@ -479,6 +492,17 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
         }
     }
 
+    private void cancelRequests(WebSocket webSocket, String reason) {
+        if (requests != null) {
+            requests.cancelAll(webSocket, reason);
+        }
+    }
+
+    /** Package-private test seam: non-streaming REQUESTs not yet ended. */
+    int activeRequestEntries() {
+        return requests == null ? 0 : requests.size();
+    }
+
     private static ThreadFactory daemonThreads(String namePrefix) {
         AtomicInteger counter = new AtomicInteger();
         return runnable -> {
@@ -570,6 +594,16 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
             if (streams != null && envelope.type() == NodeMessageType.CANCEL) {
                 messageExecutor.execute(() -> streams.cancel(envelope.requestId(), "CANCEL received"));
             }
+            // CANCEL names a requestId, not its kind: it may target a non-streaming REQUEST as well.
+            if (requests != null && envelope.type() == NodeMessageType.CANCEL) {
+                try {
+                    messageExecutor.execute(() -> requests.cancel(webSocket, envelope.requestId()));
+                } catch (RejectedExecutionException e) {
+                    // Shutting down: stop() has already cancelled every request (disconnect) and interrupts
+                    // the rest (shutdownNow) - nothing left for this CANCEL to do.
+                    log.debug("Ignoring CANCEL during shutdown, requestId={}", envelope.requestId());
+                }
+            }
             dispatchToMessageHandlers(envelope);
         }
     }
@@ -584,31 +618,7 @@ public class WebSocketOutboundNodeConnection implements OutboundNodeConnection, 
             return;
         }
 
-        messageExecutor.execute(() -> sendIfSameConnection(webSocket, serve(requestHandler, envelope)));
-    }
-
-    private <Q, R> NodeEnvelope<?> serve(NodeRequestHandler<Q, R> handler, NodeEnvelope<JsonNode> envelope) {
-        String requestId = envelope.requestId();
-
-        Q request;
-        try {
-            request = jsonMapper.treeToValue(envelope.payload(), handler.requestType());
-        } catch (RuntimeException e) {
-            log.warn("Failed to parse REQUEST payload, requestId={}", requestId, e);
-            return newEnvelope(NodeMessageType.ERROR, requestId,
-                    new NodeError(NodeError.MALFORMED_PAYLOAD, "Malformed request payload"));
-        }
-
-        // Active only while the handler runs - sending the RESPONSE/ERROR afterwards is not inference.
-        requestCounter.increment();
-        try {
-            return newEnvelope(NodeMessageType.RESPONSE, requestId, handler.handle(request));
-        } catch (RuntimeException e) {
-            log.warn("Outbound request failed, requestId={}", requestId, e);
-            return newEnvelope(NodeMessageType.ERROR, requestId, NodeErrorCarrier.toNodeError(e));
-        } finally {
-            requestCounter.decrement();
-        }
+        requests.start(webSocket, envelope);
     }
 
     private void dispatchToMessageHandlers(NodeEnvelope<JsonNode> envelope) {
