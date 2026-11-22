@@ -23,6 +23,11 @@ import java.util.function.Function;
  * code {@code REQUEST_FAILED}, or the exception's own {@link NodeErrorCarrier#nodeError()}
  * when it implements {@link NodeErrorCarrier} (e.g. {@link NodeRequestException}).
  *
+ * A CANCEL for the REQUEST interrupts the thread running {@link #handle(Object)}; a handler that
+ * reacts to the interrupt (e.g. {@code .block()}, which cancels its subscription) stops early. The
+ * request is answered with an ERROR carrying code {@code CANCELLED} once {@code handle} has returned,
+ * whatever it returned.
+ *
  * @param <Q> REQUEST payload type
  * @param <R> RESPONSE payload type
  */
