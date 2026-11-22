@@ -152,7 +152,7 @@ Session creation and Worker affinity are managed by Console.
 
 ## Data Routing Policy
 
-`RoutingRequest.dataRoutingPolicy` (`DataRoutingPolicy`, available since `0.1.6`) is the Team's rule
+`RoutingRequest.dataRoutingPolicy` (`DataRoutingPolicy`, available since `0.1.7`) is the Team's rule
 for which Workers an `AI_ROUTER` Router may pick. Console fills it from Team settings, never from
 client input.
 
@@ -607,7 +607,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.github.inframeshai:inframesh-node:0.1.6'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.7'
 }
 ```
 
@@ -617,7 +617,7 @@ dependencies {
 <dependency>
     <groupId>io.github.inframeshai</groupId>
     <artifactId>inframesh-node</artifactId>
-    <version>0.1.6</version>
+    <version>0.1.7</version>
 </dependency>
 ```
 
@@ -644,7 +644,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.github.inframeshai:inframesh-node:0.1.6'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.7'
 }
 ```
 
